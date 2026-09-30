@@ -18,6 +18,7 @@
 #define _WIN32_WINNT 0x0601
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <winhttp.h>
 #include <propidl.h>
@@ -28,7 +29,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 
 /* ================= 常量 ================= */
 #define MAX_PODCASTS    64
@@ -97,33 +97,12 @@ static int  g_playPod = -1, g_playEp = -1;
 static long long g_dur100ns = 0;
 
 /* exe 同目录 */
-static void ExeDir(wchar_t *out, int outMax);
-
-/* ================= 调试日志（临时） ================= */
-static void DbgLog(const char *fmt, ...)
+static void ExeDir(wchar_t *out, int outMax)
 {
-    wchar_t dir[MAX_PATH], path[MAX_PATH];
-    FILE *f;
-    va_list ap;
-    SYSTEMTIME st;
-    ExeDir(dir, MAX_PATH);
-    swprintf(path, MAX_PATH, L"%sdebug.log", dir);
-    f = _wfopen(path, L"a");
-    if (!f) return;
-    GetLocalTime(&st);
-    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fprintf(f, "\n");
-    fclose(f);
-}
-
-static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
-{
-    DbgLog("CRASH code=0x%08lx addr=%p", ep->ExceptionRecord->ExceptionCode,
-           ep->ExceptionRecord->ExceptionAddress);
-    return EXCEPTION_EXECUTE_HANDLER;
+    wchar_t *p;
+    GetModuleFileNameW(NULL, out, outMax);
+    p = wcsrchr(out, L'\\');
+    if (p) *(p + 1) = L'\0';
 }
 
 /* ================= 小工具 ================= */
@@ -166,15 +145,6 @@ static wchar_t* U8ToW(const char *src)
     dst = (wchar_t*)malloc(n * sizeof(wchar_t));
     if (dst) MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, n);
     return dst;
-}
-
-/* exe 同目录 */
-static void ExeDir(wchar_t *out, int outMax)
-{
-    wchar_t *p;
-    GetModuleFileNameW(NULL, out, outMax);
-    p = wcsrchr(out, L'\\');
-    if (p) *(p + 1) = L'\0';
 }
 
 /* ================= HTTP 下载 ================= */
@@ -562,11 +532,10 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
     int loaded = 0;
     (void)param;
 
-    DbgLog("loader: start");
     ExeDir(path, MAX_PATH);
     wcscat_s(path, MAX_PATH, L"feeds.txt");
     f = _wfopen(path, L"rb");
-    if (!f) { DbgLog("loader: no feeds.txt"); PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 0, 0); return 0; }
+    if (!f) { PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 0, 0); return 0; }
 
     while (fgets(line, sizeof(line), f)) {
         char *s = line;
@@ -587,25 +556,20 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
 
         wurl = U8ToW(s);
         if (!wurl) continue;
-        DbgLog("loader: fetching %s", s);
         xml = HttpFetch(wurl, &xmlLen, 0);
         free(wurl);
-        if (!xml) { DbgLog("loader: fetch failed"); continue; }
-        DbgLog("loader: fetched %lu bytes", xmlLen);
+        if (!xml) continue;
 
         pod = (Podcast*)calloc(1, sizeof(Podcast));
         if (pod && ParseFeed(xml, pod)) {
-            DbgLog("loader: parsed %d episodes", pod->epCount);
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
             loaded++;
         } else if (pod) {
-            DbgLog("loader: parse failed");
             free(pod->title); free(pod->desc); free(pod->eps); free(pod);
         }
         free(xml);
     }
     fclose(f);
-    DbgLog("loader: done, %d feeds", loaded);
     PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, 0);
     return 0;
 }
@@ -652,7 +616,7 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
 }
 
 /* ================= 音频信息探测 ================= */
-static void ProbeAudio(const wchar_t *path, wchar_t *out, int outMax)
+static void ProbeAudio(const wchar_t *path, wchar_t *out, int outMax, long long *outDur100ns)
 {
     IMFSourceReader *reader = NULL;
     IMFMediaType *mt = NULL;
@@ -661,9 +625,23 @@ static void ProbeAudio(const wchar_t *path, wchar_t *out, int outMax)
     const wchar_t *fmtName = L"音频";
     HRESULT hr;
 
+    *outDur100ns = 0;
     wcscpy_s(out, outMax, L"");
     hr = MFCreateSourceReaderFromURL(path, NULL, &reader);
     if (FAILED(hr) || !reader) return;
+
+    /* 时长（100ns）：直接从文件读，比 MFPlay 的 GetDuration 可靠 */
+    {
+        PROPVARIANT pv;
+        memset(&pv, 0, sizeof(pv));
+        if (SUCCEEDED(reader->lpVtbl->GetPresentationAttribute(reader,
+                MF_SOURCE_READER_MEDIASOURCE, &MF_PD_DURATION, &pv))) {
+            if (pv.vt == VT_UI8)      *outDur100ns = (long long)pv.uhVal.QuadPart;
+            else if (pv.vt == VT_I8)  *outDur100ns = pv.hVal.QuadPart;
+            else if (pv.vt == VT_UI4) *outDur100ns = pv.ulVal;
+        }
+    }
+
     hr = reader->lpVtbl->GetNativeMediaType(reader, MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &mt);
     if (SUCCEEDED(hr) && mt) {
         mt->lpVtbl->GetUINT32(mt, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
@@ -731,7 +709,6 @@ static void PlayerPlayFile(const wchar_t *path)
         g_player->lpVtbl->Release(g_player);
         g_player = NULL;
     }
-    g_dur100ns = 0;
     /* 传 URL + fStartPlayback=TRUE：创建即自动播放，无需 SetMediaItem/Play */
     hr = MFPCreateMediaPlayer(path, TRUE, MFP_OPTION_NONE,
             (IMFPMediaPlayerCallback*)&g_pc, g_hwnd, &g_player);
@@ -872,6 +849,30 @@ static void ReloadFeeds(void)
     CreateThread(NULL, 0, FeedLoaderThread, NULL, 0, NULL);
 }
 
+/* ================= 滑块滚轮修正 ================= */
+/* trackbar 默认滚轮方向是反的（向上滚反而减小），子类化后自己处理 */
+static WNDPROC g_oldSeekProc = NULL, g_oldVolProc = NULL;
+
+static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC old = (hwnd == g_sldSeek) ? g_oldSeekProc : g_oldVolProc;
+    if (msg == WM_MOUSEWHEEL) {
+        int isVol = (hwnd == g_sldVol);
+        int maxPos = isVol ? 100 : 1000;
+        int step  = isVol ? 5 : 20;      /* 音量 5%/格，进度 2%/格 */
+        int pos = (int)SendMessageW(hwnd, TBM_GETPOS, 0, 0);
+        pos += (GET_WHEEL_DELTA_WPARAM(wp) > 0) ? step : -step;  /* 上滚 = 增大 */
+        if (pos < 0) pos = 0;
+        if (pos > maxPos) pos = maxPos;
+        SendMessageW(hwnd, TBM_SETPOS, TRUE, pos);
+        /* 复用主窗口 WM_HSCROLL 里的现有逻辑 */
+        SendMessageW(g_hwnd, WM_HSCROLL,
+            MAKEWPARAM(isVol ? TB_THUMBTRACK : TB_ENDTRACK, pos), (LPARAM)hwnd);
+        return 0;
+    }
+    return CallWindowProcW(old, hwnd, msg, wp, lp);
+}
+
 /* ================= 布局 ================= */
 static void LayoutControls(HWND hwnd)
 {
@@ -993,6 +994,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetFontAll(ctrls, (int)(sizeof(ctrls)/sizeof(ctrls[0])));
         }
 
+        /* 滑块子类化：修复滚轮方向 */
+        g_oldSeekProc = (WNDPROC)SetWindowLongPtrW(g_sldSeek, GWLP_WNDPROC, (LONG_PTR)SliderProc);
+        g_oldVolProc  = (WNDPROC)SetWindowLongPtrW(g_sldVol,  GWLP_WNDPROC, (LONG_PTR)SliderProc);
+
         SetTimer(hwnd, 1, 500, NULL);
         return 0;
     }
@@ -1056,29 +1061,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    case WM_TIMER: {
-        static int tick = 0;
-        tick++;
-        if (tick % 20 == 0) DbgLog("heartbeat %d", tick / 2);  /* 每 10 秒 */
+    case WM_TIMER:
         if (g_playState == 1 && !g_seeking && g_player) {
             long long pos = PlayerGetPos100ns();
             long long dur = PlayerGetDur100ns();
             if (dur > 0) g_dur100ns = dur;
-            if (pos >= 0 && g_dur100ns > 0) {
+            if (pos >= 0) {
                 wchar_t buf[64], a[16], b[16];
                 FmtTime(pos / 10000000, a, 16);
-                FmtTime(g_dur100ns / 10000000, b, 16);
+                if (g_dur100ns > 0) FmtTime(g_dur100ns / 10000000, b, 16);
+                else wcscpy_s(b, 16, L"--:--");
                 swprintf(buf, 64, L"%s / %s", a, b);
                 SetWindowTextW(g_stTime, buf);
-                SendMessageW(g_sldSeek, TBM_SETPOS, TRUE,
-                    (LPARAM)(pos * 1000 / g_dur100ns));
-                if (pos >= g_dur100ns - 5000000 && pos > 0) {
-                    /* 播放结束 */
-                    PlayerStop();
-                    SetStatus(L"播放完毕");
+                if (g_dur100ns > 0) {
+                    SendMessageW(g_sldSeek, TBM_SETPOS, TRUE,
+                        (LPARAM)(pos * 1000 / g_dur100ns));
+                    if (pos >= g_dur100ns - 5000000 && pos > 0) {
+                        /* 播放结束 */
+                        PlayerStop();
+                        SetStatus(L"播放完毕");
+                    }
                 }
             }
-        }
         }
         return 0;
 
@@ -1094,7 +1098,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_APP_FEEDS_DONE:
-        DbgLog("feeds done, %d podcasts", g_podCount);
         g_feedsLoading = 0;
         if (g_podCount > 0) {
             SetStatus(L"就绪");
@@ -1111,9 +1114,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (r->ok && r->pod == g_playPod && r->ep == g_playEp &&
                 r->pod >= 0 && r->pod < g_podCount && r->ep < g_pods[r->pod].epCount) {
                 wchar_t cache[MAX_PATH], info[128], st[512];
+                long long pd = 0;
                 Episode *e = &g_pods[r->pod].eps[r->ep];
                 CachePathFor(e->url, cache, MAX_PATH);
-                ProbeAudio(cache, info, 128);
+                ProbeAudio(cache, info, 128, &pd);
+                g_dur100ns = pd;   /* 用文件探测到的时长，MFPlay 的仅作补充 */
                 SetWindowTextW(g_stInfo, info);
                 swprintf(st, 512, L"正在播放：%s", e->title);
                 SetStatus(st);
@@ -1137,9 +1142,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch ((MFP_EVENT_TYPE)wParam) {
         case MFP_EVENT_TYPE_PLAY:
             if (SUCCEEDED((HRESULT)lParam)) {
+                long long d;
                 g_playState = 1;
                 SetWindowTextW(g_btnPlay, L"暂停");
-                g_dur100ns = PlayerGetDur100ns();
+                d = PlayerGetDur100ns();
+                if (d > 0) g_dur100ns = d;
             }
             break;
         case MFP_EVENT_TYPE_PAUSE:
@@ -1184,8 +1191,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     (void)hPrev; (void)lpCmdLine;
 
-    SetUnhandledExceptionFilter(CrashHandler);
-    DbgLog("startup");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
 
@@ -1212,7 +1217,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
-    DbgLog("window created, loading feeds");
     ReloadFeeds();
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
