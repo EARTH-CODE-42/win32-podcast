@@ -91,7 +91,7 @@ enum {
     IDC_BTN_PLAY, IDC_BTN_STOP,
     IDC_ST_VOLLABEL, IDC_SLD_VOL, IDC_ST_VOL,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
-    IDC_BTN_REFRESH
+    IDC_BTN_REFRESH, IDC_BTN_FONT
 };
 
 /* ================= 全局状态 ================= */
@@ -108,17 +108,19 @@ static HWND     g_stStatus, g_stInfo, g_sldSeek, g_stTime;
 static HWND     g_btnPlay, g_btnStop, g_stVolLabel, g_sldVol, g_stVol;
 static HWND     g_listPod, g_listEp, g_editDesc;
 static HWND     g_btnRefresh;
+static HWND     g_btnFont;
 
 /* feeds.txt 中的订阅源（UTF-8）与排序/布局配置 */
 static char   **g_feedUrls = NULL;
 static int      g_feedUrlCount = 0;
 static int      g_sortCol = SORT_DATE;   /* 默认按日期 */
 static int      g_sortDir = -1;          /* -1=降序 1=升序 */
-static int      g_w1perm = 260;          /* 播客列宽，千分比 */
-static int      g_w2perm = 400;          /* 剧集列宽，千分比 */
+static int      g_w1perm = 323;          /* 播客列宽，千分比 */
+static int      g_w2perm = 383;          /* 剧集列宽，千分比 */
 static int      g_volume = 80;           /* 音量 0-100 */
-static int      g_winW = 720, g_winH = 560;  /* 窗口尺寸 */
-static int      g_colW[3] = { 300, 122, 64 };  /* 剧集列表三列像素宽 */
+static int      g_winW = 480, g_winH = 360;  /* 窗口尺寸（默认=最小 4:3） */
+static int      g_colW[3] = { 110, 88, 44 };  /* 剧集列表三列像素宽 */
+static int      g_fontLevel = 0;  /* 字号级别 0=小(默认) 1=中 2=大，全局字体随级别+1pt */
 static int      g_cfgFromTxt = 0;        /* 配置来自旧 feeds.txt，保存时迁移 */
 
 static ULONG_PTR g_gdipToken = 0;
@@ -144,6 +146,8 @@ static void ExeDir(wchar_t *out, int outMax)
 }
 
 /* ================= 小工具 ================= */
+static void ApplyLayout(HWND hwnd, int live);   /* 前置声明，字号切换后要重排 */
+
 /* 创建指定字号/字重的微软雅黑字体 */
 static HFONT CreateUiFont(int pt, int weight)
 {
@@ -155,11 +159,37 @@ static HFONT CreateUiFont(int pt, int weight)
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 }
 
-static void SetFontAll(HWND *ctrls, int n)
+/* 把当前 g_font 应用到所有控件（改字号级别后也要重发 WM_SETFONT） */
+static void ApplyFontsToControls(void)
 {
+    HWND ctrls[] = {
+        g_stStatus, g_stInfo, g_sldSeek, g_stTime,
+        g_btnPlay, g_btnStop, g_stVolLabel, g_sldVol, g_stVol, g_btnRefresh, g_btnFont,
+        g_listPod, g_listEp, g_editDesc
+    };
     int i;
-    for (i = 0; i < n; i++)
-        SendMessageW(ctrls[i], WM_SETFONT, (WPARAM)g_font, TRUE);
+    for (i = 0; i < (int)(sizeof(ctrls)/sizeof(ctrls[0])); i++)
+        if (ctrls[i]) SendMessageW(ctrls[i], WM_SETFONT, (WPARAM)g_font, TRUE);
+}
+
+/* 直接设定字号级别 0/1/2 并重建三套字体、刷新界面 */
+static void ChangeFontLevel(int nv)
+{
+    if (nv < 0) nv = 0;
+    if (nv > 2) nv = 2;
+    if (nv == g_fontLevel) return;
+    g_fontLevel = nv;
+    if (g_font)      DeleteObject(g_font);
+    if (g_fontBold)  DeleteObject(g_fontBold);
+    if (g_fontSmall) DeleteObject(g_fontSmall);
+    /* 级别0：正文8pt/播客标题8pt加粗/副标题7pt，每升一级全部+1pt */
+    g_font      = CreateUiFont(8 + nv, FW_NORMAL);
+    g_fontBold  = CreateUiFont(8 + nv, FW_BOLD);
+    g_fontSmall = CreateUiFont(7 + nv, FW_NORMAL);
+    ApplyFontsToControls();
+    InvalidateRect(g_listPod, NULL, TRUE);
+    InvalidateRect(g_listEp, NULL, TRUE);
+    ApplyLayout(g_hwnd, IsWindowVisible(g_hwnd));
 }
 
 static void FmtTime(long long sec, wchar_t *buf, size_t n)
@@ -733,9 +763,10 @@ static void LoadConfig(int startup)
     g_feedUrls = NULL; g_feedUrlCount = 0;
     if (startup) {
         g_sortCol = SORT_DATE; g_sortDir = -1;
-        g_w1perm = 260; g_w2perm = 400;
-        g_volume = 80; g_winW = 720; g_winH = 560;
-        g_colW[0] = 300; g_colW[1] = 122; g_colW[2] = 64;
+        g_w1perm = 323; g_w2perm = 383;
+        g_volume = 80; g_winW = 480; g_winH = 360;
+        g_colW[0] = 110; g_colW[1] = 88; g_colW[2] = 44;
+        g_fontLevel = 0;
         g_cfgFromTxt = 0;
     }
 
@@ -781,6 +812,7 @@ static void LoadConfig(int startup)
                 else if (strcmp(s, "cw0") == 0) g_colW[0] = atoi(val);
                 else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
                 else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
+                else if (strcmp(s, "font") == 0) g_fontLevel = atoi(val);
             }
         } else if (strstr(s, "://")) {
             AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
@@ -789,18 +821,19 @@ static void LoadConfig(int startup)
     fclose(f);
 
     if (startup) {
-        if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 260;
-        if (g_w2perm < 100 || g_w2perm > 800) g_w2perm = 400;
+        if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 323;
+        if (g_w2perm < 100 || g_w2perm > 800) g_w2perm = 383;
         if (g_winW < 480) g_winW = 480;
         if (g_winH < 360) g_winH = 360;
         if (g_winW > 4000) g_winW = 4000;
         if (g_winH > 2400) g_winH = 2400;
         {
+            static const int defCw[3] = { 110, 88, 44 };
             int ci;
             for (ci = 0; ci < 3; ci++)
-                if (g_colW[ci] < 30 || g_colW[ci] > 2000)
-                    g_colW[ci] = (ci == 0) ? 300 : (ci == 1 ? 122 : 64);
+                if (g_colW[ci] < 30 || g_colW[ci] > 2000) g_colW[ci] = defCw[ci];
         }
+        if (g_fontLevel < 0 || g_fontLevel > 2) g_fontLevel = 0;
     }
 }
 
@@ -842,6 +875,7 @@ static void SaveConfig(void)
     fprintf(f, "cw1=%d\n", g_colW[1]);
     fprintf(f, "cw2=%d\n", g_colW[2]);
     fprintf(f, "vol=%d\n", g_volume);
+    fprintf(f, "font=%d\n", g_fontLevel);
     fprintf(f, "winw=%d\n", g_winW);
     fprintf(f, "winh=%d\n\n", g_winH);
     fprintf(f, "[feeds]\n");
@@ -1391,6 +1425,11 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (hwnd == g_sldSeek) ? g_oldSeekProc : g_oldVolProc;
     if (msg == WM_MOUSEWHEEL) {
+        /* Ctrl+滚轮：调全局字号（普通滚轮才是调滑块） */
+        if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
+            ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1));
+            return 0;
+        }
         int isVol = (hwnd == g_sldVol);
         int maxPos = isVol ? 100 : 1000;
         int step  = isVol ? 5 : 20;      /* 音量 5%/格，进度 2%/格 */
@@ -1405,6 +1444,25 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     return CallWindowProcW(old, hwnd, msg, wp, lp);
+}
+
+/* 内容面板与按钮共用：Ctrl+滚轮调字号。各窗口原始过程存在自己的 GWLP_USERDATA */
+static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC old;
+    if (msg == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)) {
+        ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1));
+        return 0;
+    }
+    old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    return CallWindowProcW(old, hwnd, msg, wp, lp);
+}
+
+/* 给一个控件挂上 PanelProc，并把其原始过程保存在该窗口的 USERDATA */
+static void SubclassForFontWheel(HWND w)
+{
+    SetWindowLongPtrW(w, GWLP_USERDATA, GetWindowLongPtrW(w, GWLP_WNDPROC));
+    SetWindowLongPtrW(w, GWLP_WNDPROC, (LONG_PTR)PanelProc);
 }
 
 /* ================= 可拖动分隔条 ================= */
@@ -1472,10 +1530,11 @@ static void LayoutControls(HWND hwnd)
     gy += 28;
     MoveWindow(g_btnPlay,    gx,       gy, 56, 24, TRUE);
     MoveWindow(g_btnStop,    gx + 62,  gy, 56, 24, TRUE);
-    MoveWindow(g_stVolLabel, gx + 134, gy + 4, 32, 16, TRUE);
-    MoveWindow(g_sldVol,     gx + 168, gy, 120, 24, TRUE);
-    MoveWindow(g_stVol,      gx + 294, gy + 4, 44, 16, TRUE);
-    MoveWindow(g_btnRefresh, gx + 348, gy, 64, 24, TRUE);
+    MoveWindow(g_stVolLabel, gx + 124, gy + 4, 32, 16, TRUE);
+    MoveWindow(g_sldVol,     gx + 158, gy, 92, 24, TRUE);
+    MoveWindow(g_stVol,      gx + 254, gy + 4, 44, 16, TRUE);
+    MoveWindow(g_btnRefresh, gx + 302, gy, 64, 24, TRUE);
+    MoveWindow(g_btnFont,    gx + 372, gy, 50, 24, TRUE);
 
     by = MARGIN + TOP_H + GAP_W;
     bh = H - by - MARGIN;
@@ -1501,9 +1560,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         DWORD lbStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP
                       | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS;
 
-        g_font = CreateUiFont(9, FW_NORMAL);
-        g_fontBold = CreateUiFont(10, FW_BOLD);
-        g_fontSmall = CreateUiFont(8, FW_NORMAL);
+        g_font = CreateUiFont(8 + g_fontLevel, FW_NORMAL);
+        g_fontBold = CreateUiFont(8 + g_fontLevel, FW_BOLD);
+        g_fontSmall = CreateUiFont(7 + g_fontLevel, FW_NORMAL);
         g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
 
         g_stStatus = CreateWindowExW(0, L"STATIC", L"就绪",
@@ -1543,6 +1602,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_btnRefresh = CreateWindowExW(0, L"BUTTON", L"刷新",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_REFRESH, NULL, NULL);
+        g_btnFont = CreateWindowExW(0, L"BUTTON", L"字号",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_FONT, NULL, NULL);
 
         g_listPod = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
             lbStyle | LBS_OWNERDRAWFIXED,
@@ -1577,18 +1639,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
-        {
-            HWND ctrls[] = {
-                g_stStatus, g_stInfo, g_sldSeek, g_stTime,
-                g_btnPlay, g_btnStop, g_stVolLabel, g_sldVol, g_stVol, g_btnRefresh,
-                g_listPod, g_listEp, g_editDesc
-            };
-            SetFontAll(ctrls, (int)(sizeof(ctrls)/sizeof(ctrls[0])));
-        }
+        ApplyFontsToControls();
 
         /* 滑块子类化：修复滚轮方向 */
         g_oldSeekProc = (WNDPROC)SetWindowLongPtrW(g_sldSeek, GWLP_WNDPROC, (LONG_PTR)SliderProc);
         g_oldVolProc  = (WNDPROC)SetWindowLongPtrW(g_sldVol,  GWLP_WNDPROC, (LONG_PTR)SliderProc);
+        /* 内容面板与按钮子类化：Ctrl+滚轮调字号 */
+        SubclassForFontWheel(g_listPod);
+        SubclassForFontWheel(g_listEp);
+        SubclassForFontWheel(g_editDesc);
+        SubclassForFontWheel(g_btnPlay);
+        SubclassForFontWheel(g_btnStop);
+        SubclassForFontWheel(g_btnRefresh);
+        SubclassForFontWheel(g_btnFont);
 
         SetTimer(hwnd, 1, 500, NULL);
         return 0;
@@ -1685,6 +1748,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ApplyLayout(hwnd, IsWindowVisible(hwnd));
         return 0;
 
+    case WM_MOUSEWHEEL:
+        /* 在播放区/按钮等空白处 Ctrl+滚轮也能调字号 */
+        if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
+            ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1));
+            return 0;
+        }
+        break;
+
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
             DWORD pos = GetMessagePos();
@@ -1770,8 +1841,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO*)lParam;
-        mm->ptMinTrackSize.x = 600;
-        mm->ptMinTrackSize.y = 440;
+        mm->ptMinTrackSize.x = 480;
+        mm->ptMinTrackSize.y = 360;
         return 0;
     }
 
@@ -1788,6 +1859,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SetStatus(L"已停止");
             }
             else if (id == IDC_BTN_REFRESH) ReloadFeeds();
+            else if (id == IDC_BTN_FONT)
+                ChangeFontLevel((g_fontLevel + 1) % 3);   /* 按钮：3 级循环 */
         }
         return 0;
 
