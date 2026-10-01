@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <share.h>
 
 /* ================= 常量 ================= */
 #define MARGIN    8    /* 区域外边距 */
@@ -66,6 +67,7 @@ typedef struct {
     wchar_t *link;       /* 频道主页 */
     wchar_t *copyright;
     char    *imageUrl;   /* 封面图 URL */
+    char    *feedUrl;    /* 该播客的 RSS 订阅源地址 */
     HBITMAP  hImage;     /* 已解码的封面图，NULL=未下载或失败 */
     Episode *eps;
     int      epCount;
@@ -76,6 +78,7 @@ typedef struct {
     int pod;
     wchar_t *url;   /* 按 URL 标识，排序导致索引变化也不受影响 */
     int ok;
+    long gen;       /* 下载代号，过期任务的完成消息会被丢弃 */
 } EpReady;
 
 /* 排序列 */
@@ -98,7 +101,8 @@ static int      g_curPod = -1, g_curEp = -1;
 
 static HWND     g_hwnd;
 static HFONT    g_font;          /* 9pt 常规 */
-static HFONT    g_fontBold;      /* 11pt 加粗（播客标题） */
+static HFONT    g_fontBold;      /* 10pt 加粗（播客标题） */
+static HFONT    g_fontSmall;     /* 8pt 灰色小字（版权/副标题） */
 static HBRUSH   g_whiteBrush = NULL;
 static HWND     g_stStatus, g_stInfo, g_sldSeek, g_stTime;
 static HWND     g_btnPlay, g_btnStop, g_stVolLabel, g_sldVol, g_stVol;
@@ -113,6 +117,8 @@ static int      g_sortDir = -1;          /* -1=降序 1=升序 */
 static int      g_w1perm = 260;          /* 播客列宽，千分比 */
 static int      g_w2perm = 400;          /* 剧集列宽，千分比 */
 static int      g_volume = 80;           /* 音量 0-100 */
+static int      g_winW = 720, g_winH = 560;  /* 窗口尺寸 */
+static int      g_colW[3] = { 300, 122, 64 };  /* 剧集列表三列像素宽 */
 static int      g_cfgFromTxt = 0;        /* 配置来自旧 feeds.txt，保存时迁移 */
 
 static ULONG_PTR g_gdipToken = 0;
@@ -138,22 +144,13 @@ static void ExeDir(wchar_t *out, int outMax)
 }
 
 /* ================= 小工具 ================= */
-static HFONT CreateUiFont(void)
+/* 创建指定字号/字重的微软雅黑字体 */
+static HFONT CreateUiFont(int pt, int weight)
 {
     HDC hdc = GetDC(NULL);
-    int h = -MulDiv(9, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+    int h = -MulDiv(pt, GetDeviceCaps(hdc, LOGPIXELSY), 72);
     ReleaseDC(NULL, hdc);
-    return CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-}
-
-static HFONT CreateUiFontBold(void)
-{
-    HDC hdc = GetDC(NULL);
-    int h = -MulDiv(11, GetDeviceCaps(hdc, LOGPIXELSY), 72);
-    ReleaseDC(NULL, hdc);
-    return CreateFontW(h, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+    return CreateFontW(h, 0, 0, 0, weight, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 }
@@ -191,7 +188,11 @@ static wchar_t* U8ToW(const char *src)
 
 /* ================= HTTP 下载 ================= */
 /* 下载整个 URL 到内存。progressMsg!=0 时向 g_hwnd 汇报百分比。 */
-static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg)
+/* pReqSlot：调用方提供的槽位，函数把请求句柄放进去，外部线程可关闭它来中止下载；
+ * 传 NULL 表示不可取消（RSS/封面图）。句柄归还用 Interlocked 交换，避免双重关闭。
+ * pProgGen：进度消息 lParam 带上该代号，主线程据此丢弃过期任务的进度。 */
+static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
+                       void * volatile *pReqSlot, volatile long *pProgGen)
 {
     URL_COMPONENTS uc;
     wchar_t host[256], path[2048];
@@ -220,6 +221,10 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg)
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
     if (!hReq) goto fail;
+
+    /* 登记请求句柄到调用方槽位，供 UI 线程关闭以中止下载 */
+    if (pReqSlot)
+        InterlockedExchangePointer((PVOID volatile*)pReqSlot, (PVOID)hReq);
 
     /* 允许 gzip/deflate 自动解压 */
     {
@@ -257,19 +262,36 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg)
         if (got == 0) break;
         total += got;
         if (progressMsg && contentLen > 0)
-            PostMessageW(g_hwnd, progressMsg, (WPARAM)((unsigned __int64)total * 100 / contentLen), 0);
+            PostMessageW(g_hwnd, progressMsg,
+                (WPARAM)((unsigned __int64)total * 100 / contentLen),
+                (LPARAM)(pProgGen ? *pProgGen : 0));
     }
 
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hCon);
-    WinHttpCloseHandle(hSes);
+    /* 成功：取回句柄自行关闭；若槽位已空说明被外部取消，数据不完整算失败 */
+    {
+        HINTERNET own = pReqSlot
+            ? (HINTERNET)InterlockedExchangePointer((PVOID volatile*)pReqSlot, NULL)
+            : hReq;
+        WinHttpCloseHandle(hCon);
+        WinHttpCloseHandle(hSes);
+        if (pReqSlot && !own) {        /* 被 UI 取消 */
+            free(buf);
+            return NULL;
+        }
+        WinHttpCloseHandle(own);
+    }
     if (!buf) { buf = (char*)malloc(1); buf[0] = 0; }
     else buf[total] = 0;
     *outLen = total;
     return buf;
 
 fail:
-    if (hReq) WinHttpCloseHandle(hReq);
+    {
+        HINTERNET own = pReqSlot
+            ? (HINTERNET)InterlockedExchangePointer((PVOID volatile*)pReqSlot, NULL)
+            : hReq;
+        if (own) WinHttpCloseHandle(own);   /* 外部已关闭则跳过 */
+    }
     if (hCon) WinHttpCloseHandle(hCon);
     if (hSes) WinHttpCloseHandle(hSes);
     free(buf);
@@ -630,9 +652,9 @@ static int ParseFeed(const char *xml, Podcast *pod)
             if (!e->desc) e->desc = GetXmlTextW(seg, "content:encoded", 1);
             if (!e->desc) e->desc = _wcsdup(L"");
             e->author = GetXmlTextW(seg, "itunes:author", 0);
+            CleanXmlText(encUrl); /* 先解码 XML 转义（如 &amp; -> &），再转宽字符 */
             e->url = U8ToW(encUrl);
             if (!e->url) { free(encUrl); free(seg); item = FindOpenTag(itemEnd, "item"); continue; }
-            CleanXmlText(encUrl); /* no-op for url but safe */
             d = XmlText(seg, "itunes:duration");
             if (!d) d = XmlText(seg, "duration");
             if (d) { e->durationSec = ParseDuration(d); free(d); }
@@ -697,20 +719,25 @@ static void ParseSortValue(const char *v)
  *   [settings] 下 sort=title|date|duration:asc|desc, w1/w2=列宽千分比
  *   [feeds] 下一行一个 RSS 地址（裸 URL，直接粘贴）
  *   兼容旧版无 section 的 feeds.txt */
-static void LoadConfig(void)
+/* startup=1：启动时完整读取（含排序/列宽/音量/窗口）；
+ * startup=0：点"刷新"时只重读订阅列表，保留运行中的界面设置 */
+static void LoadConfig(int startup)
 {
     wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH], usePath[MAX_PATH];
     FILE *f;
     char line[MAX_FEED_LINE];
-    int i, section = 0;   /* 0=未知 1=settings 2=feeds */
+    int i;
 
     for (i = 0; i < g_feedUrlCount; i++) free(g_feedUrls[i]);
     free(g_feedUrls);
     g_feedUrls = NULL; g_feedUrlCount = 0;
-    g_sortCol = SORT_DATE; g_sortDir = -1;
-    g_w1perm = 260; g_w2perm = 400;
-    /* g_volume 不重置：刷新订阅时保留当前音量 */
-    g_cfgFromTxt = 0;
+    if (startup) {
+        g_sortCol = SORT_DATE; g_sortDir = -1;
+        g_w1perm = 260; g_w2perm = 400;
+        g_volume = 80; g_winW = 720; g_winH = 560;
+        g_colW[0] = 300; g_colW[1] = 122; g_colW[2] = 64;
+        g_cfgFromTxt = 0;
+    }
 
     ExeDir(iniPath, MAX_PATH);
     wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
@@ -721,10 +748,11 @@ static void LoadConfig(void)
         wcscpy_s(usePath, MAX_PATH, iniPath);
     else if (GetFileAttributesW(txtPath) != INVALID_FILE_ATTRIBUTES) {
         wcscpy_s(usePath, MAX_PATH, txtPath);
-        g_cfgFromTxt = 1;   /* 下次保存时迁移成 ini */
+        g_cfgFromTxt = 1;   /* 退出保存时迁移成 ini */
     } else return;
 
-    f = _wfopen(usePath, L"rb");
+    /* _SH_DENYNO：不拒绝其他进程读写，文件被编辑器打开也能读，读完立即关闭 */
+    f = _wfsopen(usePath, L"rb", _SH_DENYNO);
     if (!f) return;
 
     while (fgets(line, sizeof(line), f)) {
@@ -736,30 +764,44 @@ static void LoadConfig(void)
         n = strlen(s);
         while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t'))
             s[--n] = 0;
-        if (*s == 0 || *s == '#' || *s == ';') continue;
-
-        if (strncmp(s, "[settings]", 10) == 0) { section = 1; continue; }
-        if (strncmp(s, "[feeds]", 7) == 0)    { section = 2; continue; }
-        if (*s == '[') { section = 0; continue; }
+        if (*s == 0 || *s == '#' || *s == ';' || *s == '[') continue;
 
         eq = strchr(s, '=');
         if (eq) {
             char *val = eq + 1;
             *eq = 0;
             while (eq > s && (eq[-1]==' '||eq[-1]=='\t')) { eq--; *eq = 0; }
-            if (strcmp(s, "sort") == 0) ParseSortValue(val);
-            else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
-            else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
-            else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
+            if (startup) {
+                if (strcmp(s, "sort") == 0) ParseSortValue(val);
+                else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
+                else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
+                else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
+                else if (strcmp(s, "winw") == 0) g_winW = atoi(val);
+                else if (strcmp(s, "winh") == 0) g_winH = atoi(val);
+                else if (strcmp(s, "cw0") == 0) g_colW[0] = atoi(val);
+                else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
+                else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
+            }
         } else if (strstr(s, "://")) {
             AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
         }
-        (void)section;
     }
     fclose(f);
 
-    if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 260;
-    if (g_w2perm < 100 || g_w2perm > 800) g_w2perm = 400;
+    if (startup) {
+        if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 260;
+        if (g_w2perm < 100 || g_w2perm > 800) g_w2perm = 400;
+        if (g_winW < 480) g_winW = 480;
+        if (g_winH < 360) g_winH = 360;
+        if (g_winW > 4000) g_winW = 4000;
+        if (g_winH > 2400) g_winH = 2400;
+        {
+            int ci;
+            for (ci = 0; ci < 3; ci++)
+                if (g_colW[ci] < 30 || g_colW[ci] > 2000)
+                    g_colW[ci] = (ci == 0) ? 300 : (ci == 1 ? 122 : 64);
+        }
+    }
 }
 
 static const char *SortColName(void)
@@ -767,6 +809,7 @@ static const char *SortColName(void)
     return g_sortCol == SORT_TITLE ? "title" : g_sortCol == SORT_DATE ? "date" : "duration";
 }
 
+/* 仅在退出时调用一次：覆盖写 feeds.ini（文件被编辑器锁定时静默放弃，不影响退出） */
 static void SaveConfig(void)
 {
     wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH];
@@ -774,15 +817,33 @@ static void SaveConfig(void)
     int i;
     ExeDir(iniPath, MAX_PATH);
     wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
-    f = _wfopen(iniPath, L"wb");
+    f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
     if (!f) return;
+
+    /* 退出前回收剧集三列的实际宽度 */
+    if (g_listEp) {
+        int ci;
+        for (ci = 0; ci < 3; ci++) {
+            LVCOLUMNW col;
+            ZeroMemory(&col, sizeof(col));
+            col.mask = LVCF_WIDTH;
+            if (SendMessageW(g_listEp, LVM_GETCOLUMNW, ci, (LPARAM)&col))
+                g_colW[ci] = col.cx;
+        }
+    }
+
     fprintf(f, "; LightPodcast config\n");
     fprintf(f, "; Add one RSS feed URL per line under [feeds]\n");
     fprintf(f, "[settings]\n");
     fprintf(f, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
     fprintf(f, "w1=%d\n", g_w1perm);
     fprintf(f, "w2=%d\n", g_w2perm);
-    fprintf(f, "vol=%d\n\n", g_volume);
+    fprintf(f, "cw0=%d\n", g_colW[0]);
+    fprintf(f, "cw1=%d\n", g_colW[1]);
+    fprintf(f, "cw2=%d\n", g_colW[2]);
+    fprintf(f, "vol=%d\n", g_volume);
+    fprintf(f, "winw=%d\n", g_winW);
+    fprintf(f, "winh=%d\n\n", g_winH);
     fprintf(f, "[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         fprintf(f, "%s\n", g_feedUrls[i]);
@@ -817,6 +878,8 @@ static void SortPodcast(Podcast *p)
 }
 
 /* 下载封面图并缩放到 50x50 HBITMAP（GDI+ 内存流解码，不写磁盘） */
+static void FreePodcast(Podcast *p);   /* 定义在 UI 段，加载线程失败时也要用 */
+
 static HBITMAP LoadCoverImage(const char *url)
 {
     wchar_t *wurl = U8ToW(url);
@@ -830,7 +893,7 @@ static HBITMAP LoadCoverImage(const char *url)
     GpGraphics *gfx = NULL;
 
     if (!wurl) return NULL;
-    data = HttpFetch(wurl, &len, 0);
+    data = HttpFetch(wurl, &len, 0, NULL, NULL);
     free(wurl);
     if (!data || len == 0) { free(data); return NULL; }
 
@@ -873,18 +936,20 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
 
         wurl = U8ToW(g_feedUrls[i]);
         if (!wurl) continue;
-        xml = HttpFetch(wurl, &xmlLen, 0);
+        xml = HttpFetch(wurl, &xmlLen, 0, NULL, NULL);
         free(wurl);
         if (!xml) continue;
 
         pod = (Podcast*)calloc(1, sizeof(Podcast));
         if (pod && ParseFeed(xml, pod)) {
             SortPodcast(pod);
+            pod->feedUrl = _strdup(g_feedUrls[i]);
             if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl);
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
             loaded++;
         } else if (pod) {
-            free(pod->title); free(pod->desc); free(pod->eps); free(pod->imageUrl); free(pod);
+            FreePodcast(pod);
+            free(pod);
         }
         free(xml);
     }
@@ -893,7 +958,34 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
 }
 
 /* ================= 后台线程：下载音频 ================= */
-typedef struct { int pod; wchar_t *url; } DlJob;
+typedef struct {
+    int pod;
+    wchar_t *url;
+    long gen;
+    void * volatile reqSlot;   /* HttpFetch 在此登记请求句柄，供取消 */
+} DlJob;
+
+static volatile LONG g_dlGen = 0;   /* 下载代号，每次新请求 +1 */
+static DlJob *g_curDlJob = NULL;    /* 当前下载任务，仅 UI 线程访问 */
+
+/* 仅断开当前下载连接（切歌用，代号由新请求统一作废旧任务） */
+static void AbortDownloadConnection(void)
+{
+    if (g_curDlJob) {
+        HINTERNET h = (HINTERNET)InterlockedExchangePointer(
+            (PVOID volatile*)&g_curDlJob->reqSlot, NULL);
+        if (h) WinHttpCloseHandle(h);
+        g_curDlJob = NULL;
+    }
+    g_downloading = 0;
+}
+
+/* 用户点停止：断开下载并作废代号，过期完成消息将被丢弃 */
+static void CancelCurrentDownload(void)
+{
+    AbortDownloadConnection();
+    InterlockedIncrement(&g_dlGen);
+}
 
 static DWORD WINAPI EpisodeDlThread(LPVOID param)
 {
@@ -905,9 +997,10 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     FILE *f;
 
     r = (EpReady*)calloc(1, sizeof(EpReady));
-    if (!r) { free(job->url); free(job); g_downloading = 0; return 0; }
+    if (!r) { free(job->url); free(job); return 0; }
     r->pod = job->pod;
     r->url = job->url;   /* 转移所有权给 r */
+    r->gen = job->gen;
 
     if (r->url) {
         CachePathFor(r->url, cache, MAX_PATH);
@@ -915,7 +1008,7 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
         if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
             r->ok = 1;  /* 已缓存 */
         } else {
-            data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS);
+            data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS, &job->reqSlot, &job->gen);
             if (data && len > 0) {
                 f = _wfopen(cache, L"wb");
                 if (f) {
@@ -927,7 +1020,6 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
         }
     }
     free(job);
-    g_downloading = 0;
     PostMessageW(g_hwnd, WM_APP_EP_READY, 0, (LPARAM)r);
     return 0;
 }
@@ -1044,24 +1136,16 @@ static void PlayerStop(void)
     SetWindowTextW(g_stTime, L"00:00 / 00:00");
 }
 
-static long long PlayerGetPos100ns(void)
+/* 取当前位置或总时长（wantDur=1），单位 100ns；无播放器/失败返回 -1 */
+static long long PlayerGet100ns(int wantDur)
 {
     PROPVARIANT pv;
     HRESULT hr;
     if (!g_player) return -1;
     memset(&pv, 0, sizeof(pv));
-    hr = g_player->lpVtbl->GetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
-    if (FAILED(hr) || pv.vt != VT_I8) return -1;
-    return pv.hVal.QuadPart;
-}
-
-static long long PlayerGetDur100ns(void)
-{
-    PROPVARIANT pv;
-    HRESULT hr;
-    if (!g_player) return -1;
-    memset(&pv, 0, sizeof(pv));
-    hr = g_player->lpVtbl->GetDuration(g_player, &MFP_POSITIONTYPE_100NS, &pv);
+    hr = wantDur
+        ? g_player->lpVtbl->GetDuration(g_player, &MFP_POSITIONTYPE_100NS, &pv)
+        : g_player->lpVtbl->GetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
     if (FAILED(hr) || pv.vt != VT_I8) return -1;
     return pv.hVal.QuadPart;
 }
@@ -1117,6 +1201,7 @@ static void ShowPodcastDetail(int idx)
     static wchar_t buf[32768];
     size_t pos = 0;
     Podcast *p;
+    wchar_t *feedW = NULL;
     if (idx < 0 || idx >= g_podCount) return;
     p = &g_pods[idx];
     buf[0] = 0;
@@ -1126,6 +1211,13 @@ static void ShowPodcastDetail(int idx)
     ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"语言", p->lang);
     ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"主页", p->link);
     ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"版权", p->copyright);
+    if (p->feedUrl) {
+        feedW = U8ToW(p->feedUrl);
+        if (feedW) {
+            ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"订阅地址", feedW);
+            free(feedW);
+        }
+    }
     SetWindowTextW(g_editDesc, buf);
 }
 
@@ -1176,7 +1268,7 @@ static void ChangeSort(int col)
         g_sortCol = col;
         g_sortDir = (col == SORT_TITLE) ? 1 : -1;
     }
-    SaveConfig();
+    /* 排序只更新内存，退出时统一保存 */
 
     if (g_curPod < 0) return;
     sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
@@ -1200,9 +1292,13 @@ static void RequestPlayEpisode(int pod, int ep)
 {
     DlJob *job;
     Episode *e;
+    long myGen;
     if (pod < 0 || pod >= g_podCount || ep < 0 || ep >= g_pods[pod].epCount) return;
-    if (g_downloading) { SetStatus(L"正在下载中，请稍候..."); return; }
     e = &g_pods[pod].eps[ep];
+
+    /* 改主意了：立即中止旧下载、停止当前播放，转入新任务 */
+    if (g_downloading) AbortDownloadConnection();
+    PlayerStop();
 
     g_playPod = pod;
     free(g_playUrl);
@@ -1215,8 +1311,12 @@ static void RequestPlayEpisode(int pod, int ep)
     job->pod = pod;
     job->url = _wcsdup(e->url);
     if (!job->url) { free(job); return; }
+    myGen = InterlockedIncrement(&g_dlGen);
+    job->gen = myGen;
+    g_curDlJob = job;
     g_downloading = 1;
     if (!CreateThread(NULL, 0, EpisodeDlThread, job, 0, NULL)) {
+        g_curDlJob = NULL;
         g_downloading = 0;
         free(job->url); free(job);
         SetStatus(L"下载线程创建失败");
@@ -1238,27 +1338,32 @@ static void PauseResume(void)
     }
 }
 
+/* 释放单个播客的全部堆内存与图片（字段允许为 NULL） */
+static void FreePodcast(Podcast *p)
+{
+    int j;
+    for (j = 0; j < p->epCount; j++) {
+        free(p->eps[j].title);
+        free(p->eps[j].desc);
+        free(p->eps[j].url);
+        free(p->eps[j].author);
+    }
+    free(p->eps);
+    free(p->title);
+    free(p->desc);
+    free(p->author);
+    free(p->lang);
+    free(p->link);
+    free(p->copyright);
+    free(p->imageUrl);
+    free(p->feedUrl);
+    if (p->hImage) DeleteObject(p->hImage);
+}
+
 static void FreePodcasts(void)
 {
-    int i, j;
-    for (i = 0; i < g_podCount; i++) {
-        Podcast *p = &g_pods[i];
-        for (j = 0; j < p->epCount; j++) {
-            free(p->eps[j].title);
-            free(p->eps[j].desc);
-            free(p->eps[j].url);
-            free(p->eps[j].author);
-        }
-        free(p->eps);
-        free(p->title);
-        free(p->desc);
-        free(p->author);
-        free(p->lang);
-        free(p->link);
-        free(p->copyright);
-        free(p->imageUrl);
-        if (p->hImage) DeleteObject(p->hImage);
-    }
+    int i;
+    for (i = 0; i < g_podCount; i++) FreePodcast(&g_pods[i]);
     g_podCount = 0;
     g_curPod = g_curEp = -1;
 }
@@ -1266,13 +1371,14 @@ static void FreePodcasts(void)
 static void ReloadFeeds(void)
 {
     if (g_feedsLoading) return;
+    if (g_downloading) CancelCurrentDownload();   /* 刷新时中止正在进行的下载 */
     PlayerStop();
     FreePodcasts();
     SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
     SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     SetWindowTextW(g_editDesc, L"");
     SetStatus(L"正在加载订阅...");
-    LoadConfig();   /* 重新读取 feeds.txt（用户可能手动改过订阅） */
+    LoadConfig(0);   /* 只重读订阅列表，界面设置保持当前值 */
     g_feedsLoading = 1;
     CreateThread(NULL, 0, FeedLoaderThread, NULL, 0, NULL);
 }
@@ -1395,8 +1501,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         DWORD lbStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP
                       | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS;
 
-        g_font = CreateUiFont();
-        g_fontBold = CreateUiFontBold();
+        g_font = CreateUiFont(9, FW_NORMAL);
+        g_fontBold = CreateUiFont(10, FW_BOLD);
+        g_fontSmall = CreateUiFont(8, FW_NORMAL);
         g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
 
         g_stStatus = CreateWindowExW(0, L"STATIC", L"就绪",
@@ -1429,11 +1536,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             wchar_t vt[8];
             swprintf(vt, 8, L"%d%%", g_volume);
-            SetWindowTextW(g_stVol, vt);
+            g_stVol = CreateWindowExW(0, L"STATIC", vt,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0,0,0,0, hwnd, (HMENU)IDC_ST_VOL, NULL, NULL);
         }
-        g_stVol = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            0,0,0,0, hwnd, (HMENU)IDC_ST_VOL, NULL, NULL);
         g_btnRefresh = CreateWindowExW(0, L"BUTTON", L"刷新",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_REFRESH, NULL, NULL);
@@ -1441,7 +1547,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_listPod = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
             lbStyle | LBS_OWNERDRAWFIXED,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
-        SendMessageW(g_listPod, LB_SETITEMHEIGHT, 0, 54);
+        /* 行高 54px 由 WM_MEASUREITEM 统一设置 */
 
         /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
         g_listEp = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL,
@@ -1449,17 +1555,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
         {
-            static const struct { const wchar_t *t; int w; } cols[] = {
-                { L"标题", 300 }, { L"日期", 122 }, { L"时长", 64 }
-            };
+            static const wchar_t *colTitles[3] = { L"标题", L"日期", L"时长" };
             int i;
             for (i = 0; i < 3; i++) {
                 LVCOLUMNW col;
                 ZeroMemory(&col, sizeof(col));
                 col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-                col.cx = cols[i].w;
+                col.cx = g_colW[i];
                 col.iSubItem = i;
-                col.pszText = (wchar_t*)cols[i].t;
+                col.pszText = (wchar_t*)colTitles[i];
                 SendMessageW(g_listEp, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
             }
             ListView_SetExtendedListViewStyle(g_listEp,
@@ -1506,40 +1610,62 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             int isPlaying = (g_playPod == (int)di->itemID && g_playState == 1);
             HBRUSH bg = CreateSolidBrush(isSel ? RGB(204,232,255) : RGB(255,255,255));
             RECT rc = di->rcItem;
-            int imgW = 0;
+            int textLeft;
 
             FillRect(di->hDC, &rc, bg);
             DeleteObject(bg);
 
-            /* 封面图：50x50，左边距 4px，垂直居中 */
+            /* 封面图：50x50，左/上各留 2px */
             if (p->hImage) {
                 HDC mem = CreateCompatibleDC(di->hDC);
                 HBITMAP old = (HBITMAP)SelectObject(mem, p->hImage);
-                BitBlt(di->hDC, rc.left + 4, rc.top + 2, 50, 50, mem, 0, 0, SRCCOPY);
+                BitBlt(di->hDC, rc.left + 2, rc.top + 2, 50, 50, mem, 0, 0, SRCCOPY);
                 SelectObject(mem, old);
                 DeleteDC(mem);
-                imgW = 58;
+                textLeft = rc.left + 58;
             } else {
-                imgW = 6;   /* 没图就留个边距 */
+                textLeft = rc.left + 6;
             }
 
-            /* 标题：加粗 11pt，播放中绿色 */
             SetBkMode(di->hDC, TRANSPARENT);
-            SetTextColor(di->hDC, isPlaying ? RGB(0,140,60) : RGB(20,20,20));
-            SelectObject(di->hDC, g_fontBold);
-            rc.left += imgW + 6;
-            rc.right -= 46;  /* 给右侧剧集数留位置 */
-            DrawTextW(di->hDC, p->title, -1, &rc,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-            /* 右侧：剧集数，常规字体，灰色 */
+            /* 标题：10pt 加粗，顶部对齐，播放中绿色 */
+            {
+                RECT rct = rc;
+                rct.left = textLeft;
+                rct.right = rc.right - 34;
+                rct.top += 3;
+                rct.bottom = rct.top + 22;
+                SetTextColor(di->hDC, isPlaying ? RGB(0,140,60) : RGB(20,20,20));
+                SelectObject(di->hDC, g_fontBold);
+                DrawTextW(di->hDC, p->title, -1, &rct,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+
+            /* 副标题：copyright（空则 author），8pt 灰色，标题下方 */
+            {
+                const wchar_t *sub = p->copyright ? p->copyright : p->author;
+                if (sub && *sub) {
+                    RECT rcs = rc;
+                    rcs.left = textLeft;
+                    rcs.right = rc.right - 34;
+                    rcs.top += 26;
+                    rcs.bottom = rcs.top + 24;
+                    SetTextColor(di->hDC, RGB(110,110,110));
+                    SelectObject(di->hDC, g_fontSmall);
+                    DrawTextW(di->hDC, sub, -1, &rcs,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                }
+            }
+
+            /* 右侧：纯数字（剧集数） */
             {
                 wchar_t cnt[16];
                 RECT rc2 = di->rcItem;
-                swprintf(cnt, 16, L"%d 集", p->epCount);
+                swprintf(cnt, 16, L"%d", p->epCount);
                 SetTextColor(di->hDC, isSel ? RGB(40,40,40) : RGB(120,120,120));
                 SelectObject(di->hDC, g_font);
-                rc2.left = rc2.right - 44;
+                rc2.left = rc2.right - 32;
                 rc2.right -= 4;
                 DrawTextW(di->hDC, cnt, -1, &rc2,
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1552,6 +1678,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED) {
+            g_winW = LOWORD(lParam);
+            g_winH = HIWORD(lParam);
+        }
         ApplyLayout(hwnd, IsWindowVisible(hwnd));
         return 0;
 
@@ -1607,10 +1737,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_LBUTTONUP:
         if (g_dragSplit >= 0) {
-            int moved = g_dragSplit;
             g_dragSplit = -1;
             ReleaseCapture();
-            if (moved >= 0) SaveConfig();   /* 列宽持久化 */
+            /* 列宽退出时统一保存 */
             return 0;
         }
         break;
@@ -1653,14 +1782,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else if (HIWORD(wParam) == BN_CLICKED) {
             int id = LOWORD(wParam);
             if (id == IDC_BTN_PLAY) PauseResume();
-            else if (id == IDC_BTN_STOP) { PlayerStop(); SetStatus(L"已停止"); }
+            else if (id == IDC_BTN_STOP) {
+                if (g_downloading) CancelCurrentDownload();   /* 下载中点停止：中止下载 */
+                PlayerStop();
+                SetStatus(L"已停止");
+            }
             else if (id == IDC_BTN_REFRESH) ReloadFeeds();
         }
         return 0;
 
     case WM_NOTIFY: {
         NMHDR *nm = (NMHDR*)lParam;
-        if (nm->code == HDN_ITEMCLICKW || nm->code == HDN_ITEMCLICKA) {
+        if (nm->code == HDN_ITEMCLICKW) {   /* Unicode 窗口只会收到 W 版通知 */
             LPNMHEADERW hdr = (LPNMHEADERW)lParam;
             HWND hv = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
             if (nm->hwndFrom == hv && hdr->iItem >= 0 && hdr->iItem <= 2)
@@ -1687,7 +1820,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             swprintf(buf, 16, L"%d%%", v);
             SetWindowTextW(g_stVol, buf);
             if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
-            if (LOWORD(wParam) == TB_ENDTRACK) SaveConfig();   /* 松手时保存 */
+            /* 音量退出时统一保存 */
         } else if ((HWND)lParam == g_sldSeek) {
             int code = LOWORD(wParam);
             if (code == TB_THUMBTRACK || code == TB_THUMBPOSITION) {
@@ -1710,8 +1843,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_TIMER:
         if (g_playState == 1 && !g_seeking && g_player) {
-            long long pos = PlayerGetPos100ns();
-            long long dur = PlayerGetDur100ns();
+            long long pos = PlayerGet100ns(0);
+            long long dur = PlayerGet100ns(1);
             if (dur > 0) g_dur100ns = dur;
             if (pos >= 0) {
                 wchar_t buf[64], a[16], b[16];
@@ -1735,10 +1868,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_APP_FEED_ADDED: {
         Podcast *pod = (Podcast*)lParam;
-        if (pod && g_podCount < MAX_PODCASTS) {
-            g_pods[g_podCount] = *pod;
-            SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)pod->title);
-            g_podCount++;
+        if (pod) {
+            if (g_podCount < MAX_PODCASTS) {
+                g_pods[g_podCount] = *pod;
+                SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)pod->title);
+                g_podCount++;
+            } else {
+                FreePodcast(pod);   /* 超过上限：丢弃并释放 */
+            }
             free(pod);
         }
         return 0;
@@ -1751,7 +1888,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(g_listPod, LB_SETCURSEL, 0, 0);
             SelectPodcast(0);
         } else {
-            SetStatus(L"未加载到订阅，请检查 feeds.txt");
+            SetStatus(L"未加载到订阅，请检查 feeds.ini");
         }
         return 0;
 
@@ -1759,6 +1896,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         EpReady *r = (EpReady*)lParam;
         if (r) {
             int k, epIdx = -1;
+            /* 已被切歌/停止作废的任务：直接丢弃，不动当前状态 */
+            if (r->gen != g_dlGen) {
+                free(r->url);
+                free(r);
+                return 0;
+            }
+            g_curDlJob = NULL;
+            g_downloading = 0;
             if (r->ok && r->url && g_playUrl && wcscmp(r->url, g_playUrl) == 0 &&
                 r->pod >= 0 && r->pod < g_podCount) {
                 /* 按 URL 在（可能已重排的）数组里找回当前位置 */
@@ -1787,6 +1932,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_APP_DL_PROGRESS: {
         wchar_t buf[64];
+        if ((long)lParam != g_dlGen) return 0;   /* 旧任务进度，丢弃 */
         swprintf(buf, 64, L"下载音频中... %d%%", (int)wParam);
         SetStatus(buf);
         return 0;
@@ -1799,7 +1945,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 long long d;
                 g_playState = 1;
                 SetWindowTextW(g_btnPlay, L"暂停");
-                d = PlayerGetDur100ns();
+                d = PlayerGet100ns(1);
                 if (d > 0) g_dur100ns = d;
                 InvalidateRect(g_listPod, NULL, TRUE);   /* 标题变绿 */
             }
@@ -1826,13 +1972,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
-        SaveConfig();   /* 兜底保存：列宽/音量/排序 */
+        SaveConfig();   /* 退出时唯一一次写盘：排序/列宽/音量/窗口尺寸 */
         if (g_player) { g_player->lpVtbl->Release(g_player); g_player = NULL; }
         FreePodcasts();
         free(g_playUrl);
         if (g_whiteBrush) DeleteObject(g_whiteBrush);
         if (g_font) DeleteObject(g_font);
         if (g_fontBold) DeleteObject(g_fontBold);
+        if (g_fontSmall) DeleteObject(g_fontSmall);
         MFShutdown();
         CoUninitialize();
         PostQuitMessage(0);
@@ -1867,6 +2014,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     icc.dwICC  = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
 
+    /* 建窗前读取配置：排序/列宽/音量/窗口尺寸 */
+    LoadConfig(1);
+
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
     wc.style         = CS_HREDRAW | CS_VREDRAW;
@@ -1878,10 +2028,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     if (!RegisterClassExW(&wc)) return 1;
 
-    hwnd = CreateWindowExW(0, CLASS_NAME, L"LightPodcast",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 720, 560,
-        NULL, NULL, hInst, NULL);
+    /* 保存的是客户区尺寸，换算成含边框标题栏的窗口外尺寸 */
+    {
+        RECT wr = { 0, 0, g_winW, g_winH };
+        AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
+        hwnd = CreateWindowExW(0, CLASS_NAME, L"LightPodcast",
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            wr.right - wr.left, wr.bottom - wr.top,
+            NULL, NULL, hInst, NULL);
+    }
     if (!hwnd) return 1;
     g_hwnd = hwnd;
 
@@ -1890,6 +2046,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     ReloadFeeds();
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        /* ESC 退出（叉叉也是同一条退出路径，都会触发 WM_DESTROY 保存） */
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            DestroyWindow(hwnd);
+            continue;
+        }
         if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
