@@ -29,8 +29,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 /* ================= 常量 ================= */
+#define MARGIN    8    /* 区域外边距 */
+#define GAP_W     8    /* 区域间距（即可拖动分隔条的宽度） */
+#define TOP_H     88   /* 顶部播放区高度（含边框） */
 #define MAX_PODCASTS    64
 #define MAX_FEED_LINE   2048
 #define DL_BUF_SIZE     65536
@@ -46,7 +50,10 @@ typedef struct {
     wchar_t *title;
     wchar_t *desc;
     wchar_t *url;        /* enclosure URL */
+    wchar_t  dateText[24];
+    int      dateKey;    /* YYYYMMDD，0=未知 */
     int      durationSec;
+    int      origIdx;    /* RSS 原始顺序，排序 tiebreak */
 } Episode;
 
 typedef struct {
@@ -58,19 +65,21 @@ typedef struct {
 } Podcast;
 
 typedef struct {
-    int pod, ep;
+    int pod;
+    wchar_t *url;   /* 按 URL 标识，排序导致索引变化也不受影响 */
     int ok;
 } EpReady;
 
+/* 排序列 */
+enum { SORT_TITLE = 0, SORT_DATE = 1, SORT_DUR = 2 };
+
 /* ================= 控件 ID ================= */
 enum {
-    IDC_GRP_PLAY = 100, IDC_ST_STATUS, IDC_ST_INFO,
+    IDC_ST_STATUS = 100, IDC_ST_INFO,
     IDC_SLD_SEEK, IDC_ST_TIME,
     IDC_BTN_PLAY, IDC_BTN_STOP,
     IDC_ST_VOLLABEL, IDC_SLD_VOL, IDC_ST_VOL,
-    IDC_GRP_POD, IDC_LIST_POD,
-    IDC_GRP_EP, IDC_LIST_EP,
-    IDC_GRP_DESC, IDC_EDIT_DESC,
+    IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
     IDC_BTN_REFRESH
 };
 
@@ -81,10 +90,20 @@ static int      g_curPod = -1, g_curEp = -1;
 
 static HWND     g_hwnd;
 static HFONT    g_font;
-static HWND     g_grpPlay, g_stStatus, g_stInfo, g_sldSeek, g_stTime;
+static HBRUSH   g_whiteBrush = NULL;
+static HWND     g_stStatus, g_stInfo, g_sldSeek, g_stTime;
 static HWND     g_btnPlay, g_btnStop, g_stVolLabel, g_sldVol, g_stVol;
-static HWND     g_grpPod, g_listPod, g_grpEp, g_listEp, g_grpDesc, g_editDesc;
+static HWND     g_listPod, g_listEp, g_editDesc;
 static HWND     g_btnRefresh;
+
+/* feeds.txt 中的订阅源（UTF-8）与排序/布局配置 */
+static char   **g_feedUrls = NULL;
+static int      g_feedUrlCount = 0;
+static int      g_sortCol = SORT_DATE;   /* 默认按日期 */
+static int      g_sortDir = -1;          /* -1=降序 1=升序 */
+static int      g_w1perm = 260;          /* 播客列宽，千分比 */
+static int      g_w2perm = 400;          /* 剧集列宽，千分比 */
+static int      g_cfgFromTxt = 0;        /* 配置来自旧 feeds.txt，保存时迁移 */
 
 static volatile int g_feedsLoading = 0;
 static volatile int g_downloading  = 0;
@@ -93,7 +112,8 @@ static volatile int g_downloading  = 0;
 static IMFPMediaPlayer *g_player = NULL;
 static int  g_playState = 0;          /* 0=停止 1=播放 2=暂停 */
 static int  g_seeking   = 0;
-static int  g_playPod = -1, g_playEp = -1;
+static int  g_playPod = -1;
+static wchar_t *g_playUrl = NULL;   /* 当前请求播放的音频 URL */
 static long long g_dur100ns = 0;
 
 /* exe 同目录 */
@@ -421,6 +441,56 @@ static int ParseDuration(const char *s)
     return atoi(s);
 }
 
+/* RFC822（Tue, 03 Feb 2015 ...）/ ISO8601（2015-02-03T...）→ YYYYMMDD */
+static int ParseDate(const char *s, wchar_t *outText, int outN)
+{
+    static const char *months[] =
+        { "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec" };
+    int year = 0, mon = 0, day = 0, i;
+    const char *mp = NULL;
+
+    if (outText && outN > 0) outText[0] = 0;
+    if (!s) return 0;
+
+    /* ISO8601: 2015-02-03T... / 2015-02-03 */
+    if (s[0] && isdigit((unsigned char)s[0]) && s[4] == '-' && s[7] == '-') {
+        year = atoi(s);
+        mon  = atoi(s + 5);
+        day  = atoi(s + 8);
+    } else {
+        for (i = 0; i < 12; i++) {
+            const char *hit = strstr(s, months[i]);
+            if (hit) { mp = hit; mon = i + 1; break; }
+        }
+        if (mp) {
+            const char *p;
+            /* 年份：月份之后第一个 4 位数 */
+            for (p = mp + 3; *p; p++) {
+                if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
+                    isdigit((unsigned char)p[2]) && isdigit((unsigned char)p[3])) {
+                    year = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
+                    break;
+                }
+            }
+            /* 日：月份之前最后一个 1~2 位数 */
+            for (p = mp - 1; p >= s; p--) {
+                if (isdigit((unsigned char)p[0])) {
+                    int d = *p - '0';
+                    if (p > s && isdigit((unsigned char)p[-1])) { d += (p[-1]-'0')*10; }
+                    day = d;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (year >= 1900 && mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
+        if (outText) swprintf(outText, outN, L"%04d/%02d/%02d", year, mon, day);
+        return year * 10000 + mon * 100 + day;
+    }
+    return 0;
+}
+
 /* 解析 RSS，填充 Podcast */
 static int ParseFeed(const char *xml, Podcast *pod)
 {
@@ -483,6 +553,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
             }
             e = &pod->eps[pod->epCount];
             memset(e, 0, sizeof(*e));
+            e->origIdx = pod->epCount;
             e->title = GetXmlTextW(seg, "title", 0);
             if (!e->title) e->title = _wcsdup(L"(无标题)");
             e->desc = GetXmlTextW(seg, "description", 1);
@@ -495,6 +566,16 @@ static int ParseFeed(const char *xml, Podcast *pod)
             d = XmlText(seg, "itunes:duration");
             if (!d) d = XmlText(seg, "duration");
             if (d) { e->durationSec = ParseDuration(d); free(d); }
+            /* 发布日期：RSS pubDate，Atom published/updated 兜底 */
+            d = XmlText(seg, "pubDate");
+            if (!d) d = XmlText(seg, "published");
+            if (!d) d = XmlText(seg, "updated");
+            if (!d) d = XmlText(seg, "date");
+            if (d) {
+                CleanXmlText(d);
+                e->dateKey = ParseDate(d, e->dateText, 24);
+                free(d);
+            }
             pod->epCount++;
             free(encUrl);
         }
@@ -523,38 +604,158 @@ static void EnsureCacheDir(void)
     CreateDirectoryW(dir, NULL);
 }
 
-/* ================= 后台线程：加载 feeds ================= */
-static DWORD WINAPI FeedLoaderThread(LPVOID param)
+/* ================= 配置（feeds.ini：订阅源 + 排序 + 布局） ================= */
+static void AddFeedUrl(const char *s)
 {
-    wchar_t path[MAX_PATH];
+    char **p = (char**)realloc(g_feedUrls, (g_feedUrlCount + 1) * sizeof(char*));
+    if (!p) return;
+    g_feedUrls = p;
+    g_feedUrls[g_feedUrlCount] = _strdup(s);
+    if (g_feedUrls[g_feedUrlCount]) g_feedUrlCount++;
+}
+
+static void ParseSortValue(const char *v)
+{
+    if (strncmp(v, "title", 5) == 0)         g_sortCol = SORT_TITLE;
+    else if (strncmp(v, "date", 4) == 0)     g_sortCol = SORT_DATE;
+    else if (strncmp(v, "duration", 8) == 0) g_sortCol = SORT_DUR;
+    if (strstr(v, ":asc"))  g_sortDir = 1;
+    if (strstr(v, ":desc")) g_sortDir = -1;
+}
+
+/* feeds.ini 格式：
+ *   [settings] 下 sort=title|date|duration:asc|desc, w1/w2=列宽千分比
+ *   [feeds] 下一行一个 RSS 地址（裸 URL，直接粘贴）
+ *   兼容旧版无 section 的 feeds.txt */
+static void LoadConfig(void)
+{
+    wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH], usePath[MAX_PATH];
     FILE *f;
     char line[MAX_FEED_LINE];
-    int loaded = 0;
-    (void)param;
+    int i, section = 0;   /* 0=未知 1=settings 2=feeds */
 
-    ExeDir(path, MAX_PATH);
-    wcscat_s(path, MAX_PATH, L"feeds.txt");
-    f = _wfopen(path, L"rb");
-    if (!f) { PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 0, 0); return 0; }
+    for (i = 0; i < g_feedUrlCount; i++) free(g_feedUrls[i]);
+    free(g_feedUrls);
+    g_feedUrls = NULL; g_feedUrlCount = 0;
+    g_sortCol = SORT_DATE; g_sortDir = -1;
+    g_w1perm = 260; g_w2perm = 400;
+    g_cfgFromTxt = 0;
+
+    ExeDir(iniPath, MAX_PATH);
+    wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
+    ExeDir(txtPath, MAX_PATH);
+    wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
+
+    if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES)
+        wcscpy_s(usePath, MAX_PATH, iniPath);
+    else if (GetFileAttributesW(txtPath) != INVALID_FILE_ATTRIBUTES) {
+        wcscpy_s(usePath, MAX_PATH, txtPath);
+        g_cfgFromTxt = 1;   /* 下次保存时迁移成 ini */
+    } else return;
+
+    f = _wfopen(usePath, L"rb");
+    if (!f) return;
 
     while (fgets(line, sizeof(line), f)) {
-        char *s = line;
+        char *s = line, *eq;
         size_t n;
-        wchar_t *wurl;
-        DWORD xmlLen = 0;
-        char *xml;
-        Podcast *pod;
-
-        /* 去 BOM */
         if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
             s += 3;
         while (*s == ' ' || *s == '\t') s++;
         n = strlen(s);
         while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t'))
             s[--n] = 0;
-        if (*s == 0 || *s == '#') continue;
+        if (*s == 0 || *s == '#' || *s == ';') continue;
 
-        wurl = U8ToW(s);
+        if (strncmp(s, "[settings]", 10) == 0) { section = 1; continue; }
+        if (strncmp(s, "[feeds]", 7) == 0)    { section = 2; continue; }
+        if (*s == '[') { section = 0; continue; }
+
+        eq = strchr(s, '=');
+        if (eq) {
+            char *val = eq + 1;
+            *eq = 0;
+            while (eq > s && (eq[-1]==' '||eq[-1]=='\t')) { eq--; *eq = 0; }
+            if (strcmp(s, "sort") == 0) ParseSortValue(val);
+            else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
+            else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
+        } else if (strstr(s, "://")) {
+            AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
+        }
+        (void)section;
+    }
+    fclose(f);
+
+    if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 260;
+    if (g_w2perm < 100 || g_w2perm > 800) g_w2perm = 400;
+}
+
+static const char *SortColName(void)
+{
+    return g_sortCol == SORT_TITLE ? "title" : g_sortCol == SORT_DATE ? "date" : "duration";
+}
+
+static void SaveConfig(void)
+{
+    wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH];
+    FILE *f;
+    int i;
+    ExeDir(iniPath, MAX_PATH);
+    wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
+    f = _wfopen(iniPath, L"wb");
+    if (!f) return;
+    fprintf(f, "; LightPodcast config\n");
+    fprintf(f, "; Add one RSS feed URL per line under [feeds]\n");
+    fprintf(f, "[settings]\n");
+    fprintf(f, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
+    fprintf(f, "w1=%d\n", g_w1perm);
+    fprintf(f, "w2=%d\n\n", g_w2perm);
+    fprintf(f, "[feeds]\n");
+    for (i = 0; i < g_feedUrlCount; i++)
+        fprintf(f, "%s\n", g_feedUrls[i]);
+    fclose(f);
+
+    /* 首次迁移：删除旧 feeds.txt */
+    if (g_cfgFromTxt) {
+        ExeDir(txtPath, MAX_PATH);
+        wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
+        DeleteFileW(txtPath);
+        g_cfgFromTxt = 0;
+    }
+}
+
+/* ================= 排序 ================= */
+static int EpCmp(const void *pa, const void *pb)
+{
+    const Episode *a = (const Episode*)pa, *b = (const Episode*)pb;
+    int r = 0;
+    switch (g_sortCol) {
+    case SORT_TITLE: r = lstrcmpiW(a->title, b->title); break;
+    case SORT_DATE:  r = a->dateKey - b->dateKey; break;
+    default:         r = a->durationSec - b->durationSec; break;
+    }
+    if (r == 0) r = a->origIdx - b->origIdx;
+    return r * g_sortDir;
+}
+
+static void SortPodcast(Podcast *p)
+{
+    qsort(p->eps, p->epCount, sizeof(Episode), EpCmp);
+}
+
+/* ================= 后台线程：加载 feeds ================= */
+static DWORD WINAPI FeedLoaderThread(LPVOID param)
+{
+    int i, loaded = 0;
+    (void)param;
+
+    for (i = 0; i < g_feedUrlCount; i++) {
+        wchar_t *wurl;
+        DWORD xmlLen = 0;
+        char *xml;
+        Podcast *pod;
+
+        wurl = U8ToW(g_feedUrls[i]);
         if (!wurl) continue;
         xml = HttpFetch(wurl, &xmlLen, 0);
         free(wurl);
@@ -562,6 +763,7 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
 
         pod = (Podcast*)calloc(1, sizeof(Podcast));
         if (pod && ParseFeed(xml, pod)) {
+            SortPodcast(pod);
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
             loaded++;
         } else if (pod) {
@@ -569,13 +771,12 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
         }
         free(xml);
     }
-    fclose(f);
     PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, 0);
     return 0;
 }
 
 /* ================= 后台线程：下载音频 ================= */
-typedef struct { int pod, ep; } DlJob;
+typedef struct { int pod; wchar_t *url; } DlJob;
 
 static DWORD WINAPI EpisodeDlThread(LPVOID param)
 {
@@ -587,18 +788,17 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     FILE *f;
 
     r = (EpReady*)calloc(1, sizeof(EpReady));
-    if (!r) { free(job); g_downloading = 0; return 0; }
-    r->pod = job->pod; r->ep = job->ep;
+    if (!r) { free(job->url); free(job); g_downloading = 0; return 0; }
+    r->pod = job->pod;
+    r->url = job->url;   /* 转移所有权给 r */
 
-    if (job->pod >= 0 && job->pod < g_podCount &&
-        job->ep >= 0 && job->ep < g_pods[job->pod].epCount) {
-        Episode *e = &g_pods[job->pod].eps[job->ep];
-        CachePathFor(e->url, cache, MAX_PATH);
+    if (r->url) {
+        CachePathFor(r->url, cache, MAX_PATH);
         EnsureCacheDir();
         if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
             r->ok = 1;  /* 已缓存 */
         } else {
-            data = HttpFetch(e->url, &len, WM_APP_DL_PROGRESS);
+            data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS);
             if (data && len > 0) {
                 f = _wfopen(cache, L"wb");
                 if (f) {
@@ -760,17 +960,39 @@ static void PlayerSeekToFrac(int permille)
 }
 
 /* ================= UI 逻辑 ================= */
+/* 用当前播客的剧集填充 ListView（调用前数组应已排序） */
+static void FillEpisodeList(void)
+{
+    Podcast *p = &g_pods[g_curPod];
+    int i;
+    SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
+    for (i = 0; i < p->epCount; i++) {
+        wchar_t dur[16];
+        LVITEMW lvi;
+        ZeroMemory(&lvi, sizeof(lvi));
+        lvi.mask = LVIF_TEXT;
+        lvi.iItem = i;
+        lvi.pszText = p->eps[i].title;
+        SendMessageW(g_listEp, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+
+        lvi.iSubItem = 1;
+        lvi.pszText = p->eps[i].dateKey ? p->eps[i].dateText : L"";
+        SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+
+        FmtTime(p->eps[i].durationSec, dur, 16);
+        lvi.iSubItem = 2;
+        lvi.pszText = p->eps[i].durationSec > 0 ? dur : L"";
+        SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+    }
+}
+
 static void SelectPodcast(int idx)
 {
-    Podcast *p;
-    int i;
     if (idx < 0 || idx >= g_podCount) return;
     g_curPod = idx;
-    p = &g_pods[idx];
-    SendMessageW(g_listEp, LB_RESETCONTENT, 0, 0);
-    for (i = 0; i < p->epCount; i++)
-        SendMessageW(g_listEp, LB_ADDSTRING, 0, (LPARAM)p->eps[i].title);
-    SetWindowTextW(g_editDesc, p->desc);
+    SortPodcast(&g_pods[idx]);
+    FillEpisodeList();
+    SetWindowTextW(g_editDesc, g_pods[idx].desc);
 }
 
 static void SelectEpisode(int idx)
@@ -778,6 +1000,35 @@ static void SelectEpisode(int idx)
     if (g_curPod < 0 || idx < 0 || idx >= g_pods[g_curPod].epCount) return;
     g_curEp = idx;
     SetWindowTextW(g_editDesc, g_pods[g_curPod].eps[idx].desc);
+}
+
+/* 点击列头：同列切换方向，换列用默认方向（日期/时长降序，标题升序） */
+static void ChangeSort(int col)
+{
+    int oldOrig = -1, i, sel;
+    if (g_sortCol == col) g_sortDir = -g_sortDir;
+    else {
+        g_sortCol = col;
+        g_sortDir = (col == SORT_TITLE) ? 1 : -1;
+    }
+    SaveConfig();
+
+    if (g_curPod < 0) return;
+    sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+    if (sel >= 0) oldOrig = g_pods[g_curPod].eps[sel].origIdx;
+
+    SortPodcast(&g_pods[g_curPod]);
+    FillEpisodeList();
+
+    for (i = 0; i < g_pods[g_curPod].epCount; i++) {
+        if (g_pods[g_curPod].eps[i].origIdx == oldOrig) {
+            SendMessageW(g_listEp, LVM_ENSUREVISIBLE, i, FALSE);
+            SendMessageW(g_listEp, LVM_SETITEMSTATE, i,
+                (LPARAM)&(LVITEMW){ .state = LVIS_SELECTED|LVIS_FOCUSED,
+                                    .stateMask = LVIS_SELECTED|LVIS_FOCUSED });
+            break;
+        }
+    }
 }
 
 static void RequestPlayEpisode(int pod, int ep)
@@ -788,17 +1039,21 @@ static void RequestPlayEpisode(int pod, int ep)
     if (g_downloading) { SetStatus(L"正在下载中，请稍候..."); return; }
     e = &g_pods[pod].eps[ep];
 
-    g_playPod = pod; g_playEp = ep;
+    g_playPod = pod;
+    free(g_playUrl);
+    g_playUrl = _wcsdup(e->url);
     SetWindowTextW(g_editDesc, e->desc);
     SetStatus(L"准备音频...");
 
     job = (DlJob*)calloc(1, sizeof(DlJob));
     if (!job) return;
-    job->pod = pod; job->ep = ep;
+    job->pod = pod;
+    job->url = _wcsdup(e->url);
+    if (!job->url) { free(job); return; }
     g_downloading = 1;
     if (!CreateThread(NULL, 0, EpisodeDlThread, job, 0, NULL)) {
         g_downloading = 0;
-        free(job);
+        free(job->url); free(job);
         SetStatus(L"下载线程创建失败");
     }
 }
@@ -842,9 +1097,10 @@ static void ReloadFeeds(void)
     PlayerStop();
     FreePodcasts();
     SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
-    SendMessageW(g_listEp, LB_RESETCONTENT, 0, 0);
+    SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     SetWindowTextW(g_editDesc, L"");
     SetStatus(L"正在加载订阅...");
+    LoadConfig();   /* 重新读取 feeds.txt（用户可能手动改过订阅） */
     g_feedsLoading = 1;
     CreateThread(NULL, 0, FeedLoaderThread, NULL, 0, NULL);
 }
@@ -873,50 +1129,90 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcW(old, hwnd, msg, wp, lp);
 }
 
+/* ================= 可拖动分隔条 ================= */
+#define SPLIT_MINPX  90    /* 每列最小像素宽 */
+static int g_dragSplit = -1;   /* -1=无 0=第一根 1=第二根 */
+
+static void LayoutControls(HWND hwnd);   /* 前置声明 */
+
+/* 返回 (x,y) 命中的分隔条；-1=未命中 */
+static int SplitterHitTest(HWND hwnd, int x, int y)
+{
+    RECT rc;
+    int W, H, totalW, w1, w2, by, bh;
+    int s1, s2;
+    GetClientRect(hwnd, &rc);
+    W = rc.right; H = rc.bottom;
+    by = MARGIN + TOP_H + GAP_W;
+    bh = H - by - MARGIN;
+    if (y < by || y > by + bh) return -1;
+    totalW = W - 2*MARGIN - 2*GAP_W;
+    w1 = totalW * g_w1perm / 1000;
+    w2 = totalW * g_w2perm / 1000;
+    s1 = MARGIN + w1 + GAP_W / 2;
+    s2 = MARGIN + w1 + GAP_W + w2 + GAP_W / 2;
+    if (abs(x - s1) <= 4) return 0;
+    if (abs(x - s2) <= 4) return 1;
+    return -1;
+}
+
+/* 冻结重绘的整体布局，拖动/缩放共用 */
+static void ApplyLayout(HWND hwnd, int live)
+{
+    if (live) {
+        SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+        LayoutControls(hwnd);
+        SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(hwnd, NULL, NULL,
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE |
+            RDW_FRAME | RDW_UPDATENOW);
+    } else {
+        LayoutControls(hwnd);
+    }
+}
+
 /* ================= 布局 ================= */
 static void LayoutControls(HWND hwnd)
 {
     RECT rc;
     int W, H;
-    const int M = 8, GAP = 8, TOPH = 140;
     int by, bh, totalW, w1, w2, w3, x, gx, gw, gy;
 
     GetClientRect(hwnd, &rc);
     W = rc.right; H = rc.bottom;
 
-    MoveWindow(g_grpPlay, M, M, W - 2*M, TOPH, TRUE);
-    gx = M + 12; gw = W - 2*M - 24; gy = M + 20;
+    /* 顶部播放区：边框由 WM_PAINT 绘制，控件向内缩 */
+    gx = MARGIN + 8;
+    gw = W - 2*MARGIN - 16;
+    gy = MARGIN + 6;
 
     MoveWindow(g_stStatus, gx, gy, gw - 220, 18, TRUE);
     MoveWindow(g_stInfo,   gx + gw - 215, gy, 215, 18, TRUE);
-    gy += 24;
-    MoveWindow(g_sldSeek, gx, gy - 2, gw - 112, 24, TRUE);
-    MoveWindow(g_stTime,  gx + gw - 104, gy, 104, 18, TRUE);
-    gy += 32;
-    MoveWindow(g_btnPlay,    gx,       gy, 60, 24, TRUE);
-    MoveWindow(g_btnStop,    gx + 68,  gy, 60, 24, TRUE);
-    MoveWindow(g_stVolLabel, gx + 150, gy + 4, 32, 16, TRUE);
-    MoveWindow(g_sldVol,     gx + 184, gy, 130, 24, TRUE);
-    MoveWindow(g_stVol,      gx + 320, gy + 4, 44, 16, TRUE);
-    MoveWindow(g_btnRefresh, gx + 380, gy, 70, 24, TRUE);
+    gy += 22;
+    MoveWindow(g_sldSeek, gx, gy, gw - 112, 22, TRUE);
+    MoveWindow(g_stTime,  gx + gw - 104, gy + 2, 104, 18, TRUE);
+    gy += 28;
+    MoveWindow(g_btnPlay,    gx,       gy, 56, 24, TRUE);
+    MoveWindow(g_btnStop,    gx + 62,  gy, 56, 24, TRUE);
+    MoveWindow(g_stVolLabel, gx + 134, gy + 4, 32, 16, TRUE);
+    MoveWindow(g_sldVol,     gx + 168, gy, 120, 24, TRUE);
+    MoveWindow(g_stVol,      gx + 294, gy + 4, 44, 16, TRUE);
+    MoveWindow(g_btnRefresh, gx + 348, gy, 64, 24, TRUE);
 
-    by = M + TOPH + GAP;
-    bh = H - by - M;
+    by = MARGIN + TOP_H + GAP_W;
+    bh = H - by - MARGIN;
     if (bh < 40) bh = 40;
-    totalW = W - 2*M - 2*GAP;
-    w1 = totalW * 28 / 100;
-    w2 = totalW * 36 / 100;
+    totalW = W - 2*MARGIN - 2*GAP_W;
+    w1 = totalW * g_w1perm / 1000;
+    w2 = totalW * g_w2perm / 1000;
     w3 = totalW - w1 - w2;
 
-    x = M;
-    MoveWindow(g_grpPod, x, by, w1, bh, TRUE);
-    MoveWindow(g_listPod, x + 10, by + 20, w1 - 20, bh - 30, TRUE);
-    x += w1 + GAP;
-    MoveWindow(g_grpEp, x, by, w2, bh, TRUE);
-    MoveWindow(g_listEp, x + 10, by + 20, w2 - 20, bh - 30, TRUE);
-    x += w2 + GAP;
-    MoveWindow(g_grpDesc, x, by, w3, bh, TRUE);
-    MoveWindow(g_editDesc, x + 10, by + 20, w3 - 20, bh - 30, TRUE);
+    x = MARGIN;
+    MoveWindow(g_listPod,  x, by, w1, bh, TRUE);
+    x += w1 + GAP_W;
+    MoveWindow(g_listEp,   x, by, w2, bh, TRUE);
+    x += w2 + GAP_W;
+    MoveWindow(g_editDesc, x, by, w3, bh, TRUE);
 }
 
 /* ================= 窗口过程 ================= */
@@ -924,13 +1220,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg) {
     case WM_CREATE: {
-        DWORD ls = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_TABSTOP;
+        DWORD lbStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP
+                      | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS;
 
         g_font = CreateUiFont();
+        g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
 
-        g_grpPlay = CreateWindowExW(0, L"BUTTON", L"播放",
-            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-            0,0,0,0, hwnd, (HMENU)IDC_GRP_PLAY, NULL, NULL);
         g_stStatus = CreateWindowExW(0, L"STATIC", L"就绪",
             WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
             0,0,0,0, hwnd, (HMENU)IDC_ST_STATUS, NULL, NULL);
@@ -965,31 +1260,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_REFRESH, NULL, NULL);
 
-        g_grpPod = CreateWindowExW(0, L"BUTTON", L"播客",
-            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-            0,0,0,0, hwnd, (HMENU)IDC_GRP_POD, NULL, NULL);
-        g_listPod = CreateWindowExW(0, L"LISTBOX", NULL,
-            ls | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS,
+        g_listPod = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL, lbStyle,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
-        g_grpEp = CreateWindowExW(0, L"BUTTON", L"剧集",
-            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-            0,0,0,0, hwnd, (HMENU)IDC_GRP_EP, NULL, NULL);
-        g_listEp = CreateWindowExW(0, L"LISTBOX", NULL,
-            ls | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS,
+
+        /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
+        g_listEp = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
-        g_grpDesc = CreateWindowExW(0, L"BUTTON", L"简介",
-            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-            0,0,0,0, hwnd, (HMENU)IDC_GRP_DESC, NULL, NULL);
-        g_editDesc = CreateWindowExW(0, L"EDIT", NULL,
-            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_TABSTOP |
+        {
+            static const struct { const wchar_t *t; int w; } cols[] = {
+                { L"标题", 340 }, { L"日期", 92 }, { L"时长", 64 }
+            };
+            int i;
+            for (i = 0; i < 3; i++) {
+                LVCOLUMNW col;
+                ZeroMemory(&col, sizeof(col));
+                col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+                col.cx = cols[i].w;
+                col.iSubItem = i;
+                col.pszText = (wchar_t*)cols[i].t;
+                SendMessageW(g_listEp, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
+            }
+            ListView_SetExtendedListViewStyle(g_listEp,
+                LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+            SendMessageW(g_listEp, LVM_SETBKCOLOR, 0, (LPARAM)RGB(255,255,255));
+            SendMessageW(g_listEp, LVM_SETTEXTBKCOLOR, 0, (LPARAM)RGB(255,255,255));
+        }
+
+        g_editDesc = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
         {
             HWND ctrls[] = {
-                g_grpPlay, g_stStatus, g_stInfo, g_sldSeek, g_stTime,
+                g_stStatus, g_stInfo, g_sldSeek, g_stTime,
                 g_btnPlay, g_btnStop, g_stVolLabel, g_sldVol, g_stVol, g_btnRefresh,
-                g_grpPod, g_listPod, g_grpEp, g_listEp, g_grpDesc, g_editDesc
+                g_listPod, g_listEp, g_editDesc
             };
             SetFontAll(ctrls, (int)(sizeof(ctrls)/sizeof(ctrls[0])));
         }
@@ -1003,8 +1311,92 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE:
-        LayoutControls(hwnd);
+        ApplyLayout(hwnd, IsWindowVisible(hwnd));
         return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            DWORD pos = GetMessagePos();
+            POINT pt = { GET_X_LPARAM(pos), GET_Y_LPARAM(pos) };
+            ScreenToClient(hwnd, &pt);
+            if (g_dragSplit >= 0 || SplitterHitTest(hwnd, pt.x, pt.y) >= 0) {
+                SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int s = SplitterHitTest(hwnd, pt.x, pt.y);
+        if (s >= 0) {
+            g_dragSplit = s;
+            SetCapture(hwnd);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_MOUSEMOVE:
+        if (g_dragSplit >= 0) {
+            RECT rc;
+            int totalW, w1px, w2px;
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            GetClientRect(hwnd, &rc);
+            totalW = rc.right - 2*MARGIN - 2*GAP_W;
+            w1px = totalW * g_w1perm / 1000;
+            w2px = totalW * g_w2perm / 1000;
+            if (g_dragSplit == 0) {
+                w1px = pt.x - MARGIN - GAP_W/2;
+                if (w1px < SPLIT_MINPX) w1px = SPLIT_MINPX;
+                if (w1px > totalW - w2px - SPLIT_MINPX)
+                    w1px = totalW - w2px - SPLIT_MINPX;
+                g_w1perm = w1px * 1000 / totalW;
+            } else {
+                w2px = pt.x - MARGIN - w1px - 3*GAP_W/2;
+                if (w2px < SPLIT_MINPX) w2px = SPLIT_MINPX;
+                if (w2px > totalW - w1px - SPLIT_MINPX)
+                    w2px = totalW - w1px - SPLIT_MINPX;
+                g_w2perm = w2px * 1000 / totalW;
+            }
+            ApplyLayout(hwnd, 1);
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (g_dragSplit >= 0) {
+            int moved = g_dragSplit;
+            g_dragSplit = -1;
+            ReleaseCapture();
+            if (moved >= 0) SaveConfig();   /* 列宽持久化 */
+            return 0;
+        }
+        break;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT r;
+        GetClientRect(hwnd, &r);
+        r.left = MARGIN; r.top = MARGIN;
+        r.right -= MARGIN; r.bottom = MARGIN + TOP_H;
+        /* 顶部播放区：与下方三个区域同款凹陷边框 */
+        DrawEdge(hdc, &r, EDGE_SUNKEN, BF_RECT);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    /* 列表框 / 只读简介框统一白底黑字，与中间 ListView 一致 */
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)lParam == g_listPod || (HWND)lParam == g_editDesc) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, RGB(255,255,255));
+            SetTextColor(hdc, RGB(0,0,0));
+            return (LRESULT)g_whiteBrush;
+        }
+        break;
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO*)lParam;
@@ -1015,24 +1407,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND:
         if (HIWORD(wParam) == LBN_SELCHANGE) {
-            int id = LOWORD(wParam);
-            if (id == IDC_LIST_POD) {
+            if (LOWORD(wParam) == IDC_LIST_POD)
                 SelectPodcast((int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0));
-            } else if (id == IDC_LIST_EP) {
-                SelectEpisode((int)SendMessageW(g_listEp, LB_GETCURSEL, 0, 0));
-            }
-        } else if (HIWORD(wParam) == LBN_DBLCLK) {
-            if (LOWORD(wParam) == IDC_LIST_EP) {
-                int sel = (int)SendMessageW(g_listEp, LB_GETCURSEL, 0, 0);
-                if (sel >= 0) RequestPlayEpisode(g_curPod, sel);
-            }
         } else if (HIWORD(wParam) == BN_CLICKED) {
             int id = LOWORD(wParam);
             if (id == IDC_BTN_PLAY) PauseResume();
-            else if (id == IDC_BTN_STOP) PlayerStop(), SetStatus(L"已停止");
+            else if (id == IDC_BTN_STOP) { PlayerStop(); SetStatus(L"已停止"); }
             else if (id == IDC_BTN_REFRESH) ReloadFeeds();
         }
         return 0;
+
+    case WM_NOTIFY: {
+        NMHDR *nm = (NMHDR*)lParam;
+        if (nm->code == HDN_ITEMCLICKW || nm->code == HDN_ITEMCLICKA) {
+            LPNMHEADERW hdr = (LPNMHEADERW)lParam;
+            HWND hv = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
+            if (nm->hwndFrom == hv && hdr->iItem >= 0 && hdr->iItem <= 2)
+                ChangeSort(hdr->iItem);
+        } else if (nm->idFrom == IDC_LIST_EP) {
+            if (nm->code == LVN_ITEMCHANGED) {
+                LPNMLISTVIEW lv = (LPNMLISTVIEW)lParam;
+                if ((lv->uNewState & LVIS_SELECTED) && lv->iItem >= 0)
+                    SelectEpisode(lv->iItem);
+            } else if (nm->code == NM_DBLCLK) {
+                int sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                            (WPARAM)-1, LVNI_SELECTED);
+                if (sel >= 0) RequestPlayEpisode(g_curPod, sel);
+            }
+        }
+        return 0;
+    }
 
     case WM_HSCROLL:
         if ((HWND)lParam == g_sldVol) {
@@ -1111,14 +1515,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_EP_READY: {
         EpReady *r = (EpReady*)lParam;
         if (r) {
-            if (r->ok && r->pod == g_playPod && r->ep == g_playEp &&
-                r->pod >= 0 && r->pod < g_podCount && r->ep < g_pods[r->pod].epCount) {
+            int k, epIdx = -1;
+            if (r->ok && r->url && g_playUrl && wcscmp(r->url, g_playUrl) == 0 &&
+                r->pod >= 0 && r->pod < g_podCount) {
+                /* 按 URL 在（可能已重排的）数组里找回当前位置 */
+                for (k = 0; k < g_pods[r->pod].epCount; k++)
+                    if (wcscmp(g_pods[r->pod].eps[k].url, r->url) == 0) { epIdx = k; break; }
+            }
+            if (epIdx >= 0) {
                 wchar_t cache[MAX_PATH], info[128], st[512];
                 long long pd = 0;
-                Episode *e = &g_pods[r->pod].eps[r->ep];
+                Episode *e = &g_pods[r->pod].eps[epIdx];
                 CachePathFor(e->url, cache, MAX_PATH);
                 ProbeAudio(cache, info, 128, &pd);
-                g_dur100ns = pd;   /* 用文件探测到的时长，MFPlay 的仅作补充 */
+                g_dur100ns = pd;
                 SetWindowTextW(g_stInfo, info);
                 swprintf(st, 512, L"正在播放：%s", e->title);
                 SetStatus(st);
@@ -1126,6 +1536,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (!r->ok) {
                 SetStatus(L"音频下载失败");
             }
+            free(r->url);
             free(r);
         }
         return 0;
@@ -1171,6 +1582,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, 1);
         if (g_player) { g_player->lpVtbl->Release(g_player); g_player = NULL; }
         FreePodcasts();
+        free(g_playUrl);
+        if (g_whiteBrush) DeleteObject(g_whiteBrush);
         if (g_font) DeleteObject(g_font);
         MFShutdown();
         CoUninitialize();
@@ -1195,11 +1608,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
 
     icc.dwSize = sizeof(icc);
-    icc.dwICC  = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES;
+    icc.dwICC  = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.lpszClassName = CLASS_NAME;
