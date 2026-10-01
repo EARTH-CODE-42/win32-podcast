@@ -50,8 +50,9 @@ typedef struct {
     wchar_t *title;
     wchar_t *desc;
     wchar_t *url;        /* enclosure URL */
+    wchar_t *author;     /* itunes:author */
     wchar_t  dateText[24];
-    int      dateKey;    /* YYYYMMDD，0=未知 */
+    long long dateKey;   /* YYYYMMDDHHMM 分钟级，0=未知 */
     int      durationSec;
     int      origIdx;    /* RSS 原始顺序，排序 tiebreak */
 } Episode;
@@ -59,6 +60,10 @@ typedef struct {
 typedef struct {
     wchar_t *title;
     wchar_t *desc;
+    wchar_t *author;     /* itunes:author 频道级 */
+    wchar_t *lang;       /* language */
+    wchar_t *link;       /* 频道主页 */
+    wchar_t *copyright;
     Episode *eps;
     int      epCount;
     int      epCap;
@@ -103,6 +108,7 @@ static int      g_sortCol = SORT_DATE;   /* 默认按日期 */
 static int      g_sortDir = -1;          /* -1=降序 1=升序 */
 static int      g_w1perm = 260;          /* 播客列宽，千分比 */
 static int      g_w2perm = 400;          /* 剧集列宽，千分比 */
+static int      g_volume = 80;           /* 音量 0-100 */
 static int      g_cfgFromTxt = 0;        /* 配置来自旧 feeds.txt，保存时迁移 */
 
 static volatile int g_feedsLoading = 0;
@@ -347,7 +353,17 @@ static void CleanXmlText(char *s)
     while (*src) {
         if (*src == '<') {
             const char *gt = strchr(src, '>');
-            if (gt) { src = gt + 1; continue; }
+            if (gt) {
+                /* <br> <p> </p> <div> </div> 转成换行 */
+                size_t tagLen = (size_t)(gt - src);
+                if (tagLen <= 6 &&
+                    (strnicmp(src, "<br", 3) == 0 || strnicmp(src, "</br>", 5) == 0 ||
+                     strnicmp(src, "<p>", 3) == 0 || strnicmp(src, "</p>", 4) == 0 ||
+                     strnicmp(src, "<div>", 5) == 0 || strnicmp(src, "</div>", 6) == 0)) {
+                    *dst++ = '\r'; *dst++ = '\n';
+                }
+                src = gt + 1; continue;
+            }
         }
         if (*src == '&') {
             if (strncmp(src, "&lt;", 4) == 0)        { *dst++ = '<';  src += 4; continue; }
@@ -441,22 +457,28 @@ static int ParseDuration(const char *s)
     return atoi(s);
 }
 
-/* RFC822（Tue, 03 Feb 2015 ...）/ ISO8601（2015-02-03T...）→ YYYYMMDD */
-static int ParseDate(const char *s, wchar_t *outText, int outN)
+/* RFC822（Tue, 03 Feb 2015 12:34:56 ...）/ ISO8601（2015-02-03T12:34:56...）
+ * → 分钟数（year*12*31*24*60 近似），同时输出 "YYYY/MM/DD HH:MM" */
+static long long ParseDate(const char *s, wchar_t *outText, int outN)
 {
     static const char *months[] =
         { "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec" };
-    int year = 0, mon = 0, day = 0, i;
+    int year = 0, mon = 0, day = 0, hour = 0, min = 0, i;
     const char *mp = NULL;
+    long long key;
 
     if (outText && outN > 0) outText[0] = 0;
     if (!s) return 0;
 
-    /* ISO8601: 2015-02-03T... / 2015-02-03 */
+    /* ISO8601: 2015-02-03T12:34:56... / 2015-02-03 12:34 */
     if (s[0] && isdigit((unsigned char)s[0]) && s[4] == '-' && s[7] == '-') {
         year = atoi(s);
         mon  = atoi(s + 5);
         day  = atoi(s + 8);
+        if (s[10] == 'T' || s[10] == ' ') {
+            hour = atoi(s + 11);
+            if (s[13] == ':') min = atoi(s + 14);
+        }
     } else {
         for (i = 0; i < 12; i++) {
             const char *hit = strstr(s, months[i]);
@@ -469,6 +491,16 @@ static int ParseDate(const char *s, wchar_t *outText, int outN)
                 if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
                     isdigit((unsigned char)p[2]) && isdigit((unsigned char)p[3])) {
                     year = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
+                    break;
+                }
+            }
+            /* 时分：年份之后形如 "HH:MM" */
+            for (p = mp + 3; *p; p++) {
+                if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
+                    p[2] == ':' && isdigit((unsigned char)p[3]) && isdigit((unsigned char)p[4])) {
+                    int h = (p[0]-'0')*10 + (p[1]-'0');
+                    int m = (p[3]-'0')*10 + (p[4]-'0');
+                    if (h >= 0 && h < 24 && m >= 0 && m < 60) { hour = h; min = m; }
                     break;
                 }
             }
@@ -485,8 +517,11 @@ static int ParseDate(const char *s, wchar_t *outText, int outN)
     }
 
     if (year >= 1900 && mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
-        if (outText) swprintf(outText, outN, L"%04d/%02d/%02d", year, mon, day);
-        return year * 10000 + mon * 100 + day;
+        if (outText) swprintf(outText, outN, L"%04d/%02d/%02d %02d:%02d", year, mon, day, hour, min);
+        /* 分钟级排序键：年月日时分压进一个 long long，比较即排序 */
+        key = (long long)year * 100000000LL + (long long)mon * 1000000LL
+            + (long long)day * 10000LL + (long long)hour * 100LL + min;
+        return key;
     }
     return 0;
 }
@@ -510,6 +545,10 @@ static int ParseFeed(const char *xml, Podcast *pod)
         if (!pod->title) pod->title = GetXmlTextW(head, "itunes:name", 0);
         pod->desc = GetXmlTextW(head, "description", 1);
         if (!pod->desc) pod->desc = GetXmlTextW(head, "itunes:summary", 1);
+        pod->author = GetXmlTextW(head, "itunes:author", 0);
+        pod->lang = GetXmlTextW(head, "language", 0);
+        pod->link = GetXmlTextW(head, "link", 0);
+        pod->copyright = GetXmlTextW(head, "copyright", 0);
         free(head);
     }
     if (!pod->title) pod->title = _wcsdup(L"(无标题)");
@@ -560,6 +599,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
             if (!e->desc) e->desc = GetXmlTextW(seg, "itunes:summary", 1);
             if (!e->desc) e->desc = GetXmlTextW(seg, "content:encoded", 1);
             if (!e->desc) e->desc = _wcsdup(L"");
+            e->author = GetXmlTextW(seg, "itunes:author", 0);
             e->url = U8ToW(encUrl);
             if (!e->url) { free(encUrl); free(seg); item = FindOpenTag(itemEnd, "item"); continue; }
             CleanXmlText(encUrl); /* no-op for url but safe */
@@ -639,6 +679,7 @@ static void LoadConfig(void)
     g_feedUrls = NULL; g_feedUrlCount = 0;
     g_sortCol = SORT_DATE; g_sortDir = -1;
     g_w1perm = 260; g_w2perm = 400;
+    /* g_volume 不重置：刷新订阅时保留当前音量 */
     g_cfgFromTxt = 0;
 
     ExeDir(iniPath, MAX_PATH);
@@ -679,6 +720,7 @@ static void LoadConfig(void)
             if (strcmp(s, "sort") == 0) ParseSortValue(val);
             else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
             else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
+            else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
         } else if (strstr(s, "://")) {
             AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
         }
@@ -709,7 +751,8 @@ static void SaveConfig(void)
     fprintf(f, "[settings]\n");
     fprintf(f, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
     fprintf(f, "w1=%d\n", g_w1perm);
-    fprintf(f, "w2=%d\n\n", g_w2perm);
+    fprintf(f, "w2=%d\n", g_w2perm);
+    fprintf(f, "vol=%d\n\n", g_volume);
     fprintf(f, "[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         fprintf(f, "%s\n", g_feedUrls[i]);
@@ -986,20 +1029,68 @@ static void FillEpisodeList(void)
     }
 }
 
+/* 把字段拼成 "【标题】\r\n内容\r\n\r\n..." 塞进简介框 */
+static void ShowDetailField(wchar_t *buf, size_t bufSize, size_t *pos,
+                            const wchar_t *label, const wchar_t *value)
+{
+    if (!value || !*value) return;
+    *pos += swprintf(buf + *pos, bufSize - *pos,
+        L"【%s】\r\n%s\r\n\r\n", label, value);
+}
+
+static void ShowPodcastDetail(int idx)
+{
+    static wchar_t buf[32768];
+    size_t pos = 0;
+    Podcast *p;
+    if (idx < 0 || idx >= g_podCount) return;
+    p = &g_pods[idx];
+    buf[0] = 0;
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"标题", p->title);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"描述", p->desc);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"作者", p->author);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"语言", p->lang);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"主页", p->link);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"版权", p->copyright);
+    SetWindowTextW(g_editDesc, buf);
+}
+
+static void ShowEpisodeDetail(int podIdx, int epIdx)
+{
+    static wchar_t buf[32768];
+    size_t pos = 0;
+    Episode *e;
+    wchar_t dur[16];
+    if (podIdx < 0 || podIdx >= g_podCount) return;
+    if (epIdx < 0 || epIdx >= g_pods[podIdx].epCount) return;
+    e = &g_pods[podIdx].eps[epIdx];
+    buf[0] = 0;
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"标题", e->title);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"描述", e->desc);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"作者", e->author);
+    if (e->dateKey) ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"发布", e->dateText);
+    if (e->durationSec > 0) {
+        FmtTime(e->durationSec, dur, 16);
+        ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"时长", dur);
+    }
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"链接", e->url);
+    SetWindowTextW(g_editDesc, buf);
+}
+
 static void SelectPodcast(int idx)
 {
     if (idx < 0 || idx >= g_podCount) return;
     g_curPod = idx;
     SortPodcast(&g_pods[idx]);
     FillEpisodeList();
-    SetWindowTextW(g_editDesc, g_pods[idx].desc);
+    ShowPodcastDetail(idx);
 }
 
 static void SelectEpisode(int idx)
 {
     if (g_curPod < 0 || idx < 0 || idx >= g_pods[g_curPod].epCount) return;
     g_curEp = idx;
-    SetWindowTextW(g_editDesc, g_pods[g_curPod].eps[idx].desc);
+    ShowEpisodeDetail(g_curPod, idx);
 }
 
 /* 点击列头：同列切换方向，换列用默认方向（日期/时长降序，标题升序） */
@@ -1082,10 +1173,15 @@ static void FreePodcasts(void)
             free(p->eps[j].title);
             free(p->eps[j].desc);
             free(p->eps[j].url);
+            free(p->eps[j].author);
         }
         free(p->eps);
         free(p->title);
         free(p->desc);
+        free(p->author);
+        free(p->lang);
+        free(p->link);
+        free(p->copyright);
     }
     g_podCount = 0;
     g_curPod = g_curEp = -1;
@@ -1252,8 +1348,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
             0,0,0,0, hwnd, (HMENU)IDC_SLD_VOL, NULL, NULL);
         SendMessageW(g_sldVol, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
-        SendMessageW(g_sldVol, TBM_SETPOS, TRUE, 80);
-        g_stVol = CreateWindowExW(0, L"STATIC", L"80%",
+        SendMessageW(g_sldVol, TBM_SETPOS, TRUE, g_volume);
+        {
+            wchar_t vt[8];
+            swprintf(vt, 8, L"%d%%", g_volume);
+            SetWindowTextW(g_stVol, vt);
+        }
+        g_stVol = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             0,0,0,0, hwnd, (HMENU)IDC_ST_VOL, NULL, NULL);
         g_btnRefresh = CreateWindowExW(0, L"BUTTON", L"刷新",
@@ -1270,7 +1371,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
         {
             static const struct { const wchar_t *t; int w; } cols[] = {
-                { L"标题", 340 }, { L"日期", 92 }, { L"时长", 64 }
+                { L"标题", 300 }, { L"日期", 122 }, { L"时长", 64 }
             };
             int i;
             for (i = 0; i < 3; i++) {
@@ -1442,9 +1543,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if ((HWND)lParam == g_sldVol) {
             wchar_t buf[16];
             int v = (int)SendMessageW(g_sldVol, TBM_GETPOS, 0, 0);
+            g_volume = v;
             swprintf(buf, 16, L"%d%%", v);
             SetWindowTextW(g_stVol, buf);
             if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
+            if (LOWORD(wParam) == TB_ENDTRACK) SaveConfig();   /* 松手时保存 */
         } else if ((HWND)lParam == g_sldSeek) {
             int code = LOWORD(wParam);
             if (code == TB_THUMBTRACK || code == TB_THUMBPOSITION) {
@@ -1580,6 +1683,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        SaveConfig();   /* 兜底保存：列宽/音量/排序 */
         if (g_player) { g_player->lpVtbl->Release(g_player); g_player = NULL; }
         FreePodcasts();
         free(g_playUrl);
