@@ -24,6 +24,9 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <shellapi.h>
 #include <winhttp.h>
 #include <propidl.h>
 #include <mfapi.h>
@@ -94,7 +97,8 @@ enum {
     IDC_ST_TIME = 100, IDC_ST_FORMAT, IDC_ST_VOL,
     IDC_SLD_SEEK, IDC_SLD_VOL,
     IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
-    IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH,
+    IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
+    IDC_BTN_DIR,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC
 };
 
@@ -112,7 +116,16 @@ static HWND     g_sldSeek, g_stTime;
 static HWND     g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute;
 static HWND     g_sldVol, g_stVol, g_stFormat;
 static HWND     g_listPod, g_listEp, g_editDesc;
-static HWND     g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh;
+static HWND     g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode;
+static HWND     g_btnDir;
+
+/* 缓存目录：默认程序目录下 cache，可由用户更改，退出时存入 ini */
+static wchar_t  g_cacheDir[MAX_PATH] = L"";
+
+/* 工具提示 */
+static HWND     g_hwndTip = NULL;        /* 系统 tooltip：按钮 + 剧集条目 */
+static HWND     g_hwndPodTip = NULL;     /* 自定义 tooltip：播客封面+标题+作者 */
+static int      g_tipPodIdx = -1;        /* 当前播客提示对应的条目下标 */
 
 /* 顶栏状态文本（自绘跑马灯） */
 static wchar_t  g_statusText[512] = L"就绪";
@@ -123,6 +136,7 @@ static int      g_mqActive = 0;       /* 文本超长，正在滚动 */
 /* 播客列表模式：0=普通 1=删除 2=排序（互斥） */
 static int      g_podMode = 0;
 static int      g_muted = 0;          /* 静音 */
+static int      g_playMode = 0;       /* 播放模式：0=顺序 1=随机 2=单曲循环 */
 
 /* feeds.txt 中的订阅源（UTF-8）与排序/布局配置 */
 static char   **g_feedUrls = NULL;
@@ -162,6 +176,8 @@ static void ExeDir(wchar_t *out, int outMax)
 /* ================= 小工具 ================= */
 static void ApplyLayout(HWND hwnd, int live);   /* 前置声明，字号切换后要重排 */
 static void UpdateMarquee(void);                /* 前置声明，字号切换后要重测文本宽 */
+static void UpdatePodTipFromPoint(POINT pt);    /* 前置声明，播客列表悬停提示 */
+static char* WToU8(const wchar_t *w);           /* 前置声明，SaveConfig 保存缓存目录 */
 
 /* 创建指定字号/字重的微软雅黑字体 */
 static HFONT CreateUiFont(int pt, int weight)
@@ -181,7 +197,7 @@ static void ApplyFontsToControls(void)
         g_sldSeek, g_stTime,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_sldVol, g_stVol, g_stFormat,
-        g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh,
+        g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode, g_btnDir,
         g_listPod, g_listEp, g_editDesc
     };
     int i;
@@ -770,22 +786,47 @@ static int ParseFeed(const char *xml, Podcast *pod)
 }
 
 /* ================= 缓存 ================= */
+/* 返回当前缓存目录（末尾带反斜杠）；未设置时默认程序目录下 cache */
+static void CacheDir(wchar_t *out, int outMax)
+{
+    if (g_cacheDir[0]) {
+        wcsncpy(out, g_cacheDir, outMax - 1);
+        out[outMax - 1] = 0;
+    } else {
+        ExeDir(out, outMax);
+        wcscat_s(out, outMax, L"cache");
+    }
+    int len = (int)wcslen(out);
+    if (len > 0 && out[len - 1] != L'\\' && len < outMax - 1) {
+        out[len] = L'\\'; out[len + 1] = 0;
+    }
+}
+
 static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
 {
     unsigned long h = 5381;
     const wchar_t *p = url;
     wchar_t dir[MAX_PATH];
     while (*p) h = ((h << 5) + h) ^ (unsigned long)*p++;
-    ExeDir(dir, MAX_PATH);
-    swprintf(out, outMax, L"%scache\\%08lx.mp3", dir, h);
+    CacheDir(dir, MAX_PATH);
+    swprintf(out, outMax, L"%s%08lx.mp3", dir, h);
 }
 
 static void EnsureCacheDir(void)
 {
     wchar_t dir[MAX_PATH];
-    ExeDir(dir, MAX_PATH);
-    wcscat_s(dir, MAX_PATH, L"cache");
+    CacheDir(dir, MAX_PATH);
+    dir[wcslen(dir) - 1] = 0;   /* 去掉末尾反斜杠 */
     CreateDirectoryW(dir, NULL);
+}
+
+/* 剧集是否已缓存到本地 */
+static int EpisodeIsCached(Episode *e)
+{
+    wchar_t path[MAX_PATH];
+    if (!e || !e->url) return 0;
+    CachePathFor(e->url, path, MAX_PATH);
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
 /* ================= 配置（feeds.ini：订阅源 + 排序 + 布局） ================= */
@@ -875,6 +916,10 @@ static void LoadConfig(int startup)
                 else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
                 else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
                 else if (strcmp(s, "font") == 0) g_fontLevel = atoi(val);
+                else if (strcmp(s, "cachedir") == 0) {
+                    wchar_t *w = U8ToW(val);
+                    if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
+                }
             }
         } else if (strstr(s, "://")) {
             AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
@@ -939,8 +984,12 @@ static void SaveConfig(void)
     fprintf(f, "vol=%d\n", g_volume);
     fprintf(f, "font=%d\n", g_fontLevel);
     fprintf(f, "winw=%d\n", g_winW);
-    fprintf(f, "winh=%d\n\n", g_winH);
-    fprintf(f, "[feeds]\n");
+    fprintf(f, "winh=%d\n", g_winH);
+    if (g_cacheDir[0]) {
+        char *u8 = WToU8(g_cacheDir);
+        if (u8) { fprintf(f, "cachedir=%s\n", u8); free(u8); }
+    }
+    fprintf(f, "\n[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         fprintf(f, "%s\n", g_feedUrls[i]);
     fclose(f);
@@ -973,7 +1022,7 @@ static void SortPodcast(Podcast *p)
     qsort(p->eps, p->epCount, sizeof(Episode), EpCmp);
 }
 
-/* 下载封面图并缩放到 50x50 HBITMAP（GDI+ 内存流解码，不写磁盘） */
+/* 下载封面图并解码为 HBITMAP（保留原始分辨率，列表/提示窗按需缩放，不写磁盘） */
 static void FreePodcast(Podcast *p);   /* 定义在 UI 段，加载线程失败时也要用 */
 
 static HBITMAP LoadCoverImage(const char *url)
@@ -985,8 +1034,6 @@ static HBITMAP LoadCoverImage(const char *url)
     HGLOBAL hMem;
     IStream *stm;
     GpBitmap *bmp = NULL;
-    GpBitmap *thumb = NULL;
-    GpGraphics *gfx = NULL;
 
     if (!wurl) return NULL;
     data = HttpFetch(wurl, &len, 0, NULL, NULL);
@@ -1001,17 +1048,8 @@ static HBITMAP LoadCoverImage(const char *url)
 
     if (CreateStreamOnHGlobal(hMem, TRUE, &stm) != S_OK) { GlobalFree(hMem); return NULL; }
     if (GdipCreateBitmapFromStream(stm, &bmp) == 0 && bmp) {
-        GdipCreateBitmapFromScan0(50, 50, 0, PixelFormat32bppARGB, NULL, &thumb);
-        if (thumb) {
-            GdipGetImageGraphicsContext((GpImage*)thumb, &gfx);
-            if (gfx) {
-                GdipSetInterpolationMode(gfx, InterpolationModeHighQualityBicubic);
-                GdipDrawImageRect((GpGraphics*)gfx, (GpImage*)bmp, 0, 0, 50, 50);
-                GdipDeleteGraphics(gfx);
-            }
-            GdipCreateHBITMAPFromBitmap(thumb, &hbmp, 0);
-            GdipDisposeImage((GpImage*)thumb);
-        }
+        /* 直接转出原始尺寸的 HBITMAP，调用方按需缩放 */
+        GdipCreateHBITMAPFromBitmap(bmp, &hbmp, 0);
         GdipDisposeImage((GpImage*)bmp);
     }
     stm->lpVtbl->Release(stm);
@@ -1019,38 +1057,77 @@ static HBITMAP LoadCoverImage(const char *url)
 }
 
 /* ================= 后台线程：加载 feeds ================= */
+/* 加载单条订阅：成功返回 Podcast*（已排序、含封面、feedUrl 已设），失败返回 NULL */
+static Podcast* LoadOneFeed(const char *url)
+{
+    wchar_t *wurl;
+    DWORD xmlLen = 0;
+    char *xml;
+    Podcast *pod;
+
+    wurl = U8ToW(url);
+    if (!wurl) return NULL;
+    xml = HttpFetch(wurl, &xmlLen, 0, NULL, NULL);
+    free(wurl);
+    if (!xml) return NULL;
+
+    pod = (Podcast*)calloc(1, sizeof(Podcast));
+    if (pod && ParseFeed(xml, pod)) {
+        SortPodcast(pod);
+        pod->feedUrl = _strdup(url);
+        if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl);
+        free(xml);
+        return pod;
+    }
+    if (pod) { FreePodcast(pod); free(pod); }
+    free(xml);
+    return NULL;
+}
+
 static DWORD WINAPI FeedLoaderThread(LPVOID param)
 {
     int i, loaded = 0;
     (void)param;
 
     for (i = 0; i < g_feedUrlCount; i++) {
-        wchar_t *wurl;
-        DWORD xmlLen = 0;
-        char *xml;
-        Podcast *pod;
-
-        wurl = U8ToW(g_feedUrls[i]);
-        if (!wurl) continue;
-        xml = HttpFetch(wurl, &xmlLen, 0, NULL, NULL);
-        free(wurl);
-        if (!xml) continue;
-
-        pod = (Podcast*)calloc(1, sizeof(Podcast));
-        if (pod && ParseFeed(xml, pod)) {
-            SortPodcast(pod);
-            pod->feedUrl = _strdup(g_feedUrls[i]);
-            if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl);
+        Podcast *pod = LoadOneFeed(g_feedUrls[i]);
+        if (pod) {
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
             loaded++;
-        } else if (pod) {
-            FreePodcast(pod);
-            free(pod);
         }
-        free(xml);
     }
     PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, 0);
     return 0;
+}
+
+/* 单条订阅加载线程参数 */
+typedef struct { char *url; } SingleFeedArg;
+
+static DWORD WINAPI SingleFeedLoaderThread(LPVOID param)
+{
+    SingleFeedArg *a = (SingleFeedArg*)param;
+    Podcast *pod = LoadOneFeed(a->url);
+    free(a->url);
+    free(a);
+    if (pod) {
+        PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 1, (LPARAM)pod);   /* wParam=1 表示增量添加 */
+        PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 1, 0);
+    } else {
+        PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 0, 0);
+    }
+    return 0;
+}
+
+/* 添加单条订阅（不刷新全部） */
+static void AddSingleFeed(const char *url)
+{
+    SingleFeedArg *a = (SingleFeedArg*)malloc(sizeof(SingleFeedArg));
+    if (!a) return;
+    a->url = _strdup(url);
+    if (!a->url) { free(a); return; }
+    SetStatus(L"正在加载订阅...");
+    g_feedsLoading = 1;
+    CreateThread(NULL, 0, SingleFeedLoaderThread, a, 0, NULL);
 }
 
 /* ================= 后台线程：下载音频 ================= */
@@ -1232,6 +1309,7 @@ static void PlayerStop(void)
     SetWindowTextW(g_stTime, L"00:00 / 00:00");
     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE, 0);
     if (g_stFormat) SetWindowTextW(g_stFormat, L"");
+    if (g_listEp) InvalidateRect(g_listEp, NULL, TRUE);      /* 剧集颜色复位 */
 }
 
 /* 取当前位置或总时长（wantDur=1），单位 100ns；无播放器/失败返回 -1 */
@@ -1449,16 +1527,20 @@ static void PauseResume(void)
     }
 }
 
-/* 上一曲/下一曲：按当前剧集列表顺序，越界首尾循环 */
+/* 上一曲/下一曲：按当前剧集列表顺序，越界首尾循环；随机模式下取随机项 */
 static void PlayAdjacent(int delta)
 {
     int n, target;
     if (g_curPod < 0 || g_curPod >= g_podCount) return;
     n = g_pods[g_curPod].epCount;
     if (n <= 0) return;
-    target = (g_curEp < 0) ? 0 : g_curEp + delta;
-    if (target < 0) target = n - 1;
-    if (target >= n) target = 0;
+    if (g_playMode == 1 && n > 1) {
+        do { target = rand() % n; } while (target == g_curEp);
+    } else {
+        target = (g_curEp < 0) ? 0 : g_curEp + delta;
+        if (target < 0) target = n - 1;
+        if (target >= n) target = 0;
+    }
     RequestPlayEpisode(g_curPod, target);
 }
 
@@ -1766,8 +1848,8 @@ static void AskAddFeed(void)
         if (u8) {
             AddFeedUrl(u8);
             AppendFeedToIni(u8);
+            AddSingleFeed(u8);   /* 只加载新增的这一条，不刷新全部 */
             free(u8);
-            ReloadFeeds();   /* 添加后自动刷新 */
         }
     }
 }
@@ -1836,20 +1918,47 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcW(old, hwnd, msg, wp, lp);
 }
 
-/* 内容面板与按钮共用：Ctrl+滚轮调字号。各窗口原始过程存在自己的 GWLP_USERDATA */
+/* 内容面板与按钮共用：Ctrl+滚轮调字号 + 转发鼠标消息给 tooltip。
+ * 各窗口原始过程存在自己的 GWLP_USERDATA */
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
+    /* 把所有鼠标消息转发给系统 tooltip（替代 TTF_SUBCLASS，
+     * 避免与本过程的 GWLP_WNDPROC 子类化冲突导致提示不显示） */
+    if (g_hwndTip && msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) {
+        MSG m;
+        m.hwnd = hwnd; m.message = msg; m.wParam = wp; m.lParam = lp;
+        SendMessageW(g_hwndTip, TTM_RELAYEVENT, 0, (LPARAM)&m);
+    }
     /* 删除/排序模式下，播客列表的点击全部自管（不允许改选中项） */
     if (hwnd == g_listPod && msg == WM_LBUTTONDOWN && g_podMode != 0) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         PodListModeClick(pt);
         return 0;
     }
+    /* 播客列表悬停 → 显示封面+标题+作者提示 */
+    if (hwnd == g_listPod) {
+        if (msg == WM_MOUSEMOVE) {
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_HOVER | TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            tme.dwHoverTime = HOVER_DEFAULT;
+            TrackMouseEvent(&tme);
+        } else if (msg == WM_MOUSEHOVER) {
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            UpdatePodTipFromPoint(pt);
+        } else if (msg == WM_MOUSELEAVE) {
+            ShowWindow(g_hwndPodTip, SW_HIDE);
+        }
+    }
     if (msg == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)) {
         ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1));
         return 0;
     }
+    /* 播客列表滚动时，隐藏悬停提示避免显示旧条目 */
+    if (hwnd == g_listPod && msg == WM_MOUSEWHEEL)
+        ShowWindow(g_hwndPodTip, SW_HIDE);
     old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     return CallWindowProcW(old, hwnd, msg, wp, lp);
 }
@@ -1910,7 +2019,7 @@ static void LayoutControls(HWND hwnd)
     RECT rc;
     int W, H;
     int by, bh, totalW, w1, w2, w3, x, gx, gw, gy, bx;
-    int fmtW = 150, volW = 36, sw, fmtX;
+    int volW = 24, sw = 84, fmtX;
 
     GetClientRect(hwnd, &rc);
     W = rc.right; H = rc.bottom;
@@ -1925,20 +2034,19 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(g_stTime,  gx + gw - 104, gy + 2, 104, 18, TRUE);
     gy += 28;
 
-    /* 第3行：上一曲/播放/下一曲/停止/静音（24px 方形图标） */
+    /* 第3行：上一曲/播放/下一曲/停止/播放模式/静音（间距统一 26，给格式串留空间） */
     bx = gx;
-    MoveWindow(g_btnPrev, bx, gy, 24, 24, TRUE); bx += 27;
-    MoveWindow(g_btnPlay, bx, gy, 24, 24, TRUE); bx += 27;
-    MoveWindow(g_btnNext, bx, gy, 24, 24, TRUE); bx += 27;
-    MoveWindow(g_btnStop, bx, gy, 24, 24, TRUE); bx += 30;
-    MoveWindow(g_btnMute, bx, gy, 24, 24, TRUE); bx += 28;
-    /* 音量滑块 + 百分比；格式串右靠齐 */
-    fmtX = gx + gw - fmtW;
-    sw = fmtX - 8 - (bx + 4 + volW);
-    if (sw < 60) sw = 60;
+    MoveWindow(g_btnPrev,     bx, gy, 24, 24, TRUE); bx += 26;
+    MoveWindow(g_btnPlay,     bx, gy, 24, 24, TRUE); bx += 26;
+    MoveWindow(g_btnNext,     bx, gy, 24, 24, TRUE); bx += 26;
+    MoveWindow(g_btnStop,     bx, gy, 24, 24, TRUE); bx += 26;
+    MoveWindow(g_btnPlayMode, bx, gy, 24, 24, TRUE); bx += 26;
+    MoveWindow(g_btnMute,     bx, gy, 24, 24, TRUE); bx += 26;
+    /* 音量滑块固定宽 + 数字；格式串右靠齐，占满剩余空间 */
+    fmtX = bx + sw + 4 + volW + 8;
     MoveWindow(g_sldVol,   bx, gy, sw, 24, TRUE);
     MoveWindow(g_stVol,    bx + sw + 4, gy + 4, volW, 16, TRUE);
-    MoveWindow(g_stFormat, fmtX, gy + 4, fmtW, 16, TRUE);
+    MoveWindow(g_stFormat, fmtX, gy + 4, gx + gw - fmtX, 16, TRUE);
 
     by = MARGIN + TOP_H + GAP_W;
     bh = H - by - MARGIN;
@@ -1948,12 +2056,13 @@ static void LayoutControls(HWND hwnd)
     w2 = totalW * g_w2perm / 1000;
     w3 = totalW - w1 - w2;
 
-    /* 播客列顶部工具栏（+/-/排序/刷新），列表向下让出 28px */
+    /* 播客列顶部工具栏（+/−/排序/刷新/目录），列表向下让出 28px */
     x = MARGIN;
-    MoveWindow(g_btnAdd,     x, by, 24, 24, TRUE);
+    MoveWindow(g_btnAdd,     x,      by, 24, 24, TRUE);
     MoveWindow(g_btnDel,     x + 27, by, 24, 24, TRUE);
     MoveWindow(g_btnSort,    x + 54, by, 24, 24, TRUE);
     MoveWindow(g_btnRefresh, x + 81, by, 24, 24, TRUE);
+    MoveWindow(g_btnDir,     x + 108, by, 24, 24, TRUE);
     MoveWindow(g_listPod, x, by + 28, w1, bh - 28, TRUE);
     x += w1 + GAP_W;
     MoveWindow(g_listEp,   x, by, w2, bh, TRUE);
@@ -1964,7 +2073,8 @@ static void LayoutControls(HWND hwnd)
 /* ================= 方形图标按钮（owner-draw） ================= */
 enum {
     ICO_PREV, ICO_PLAY, ICO_PAUSE, ICO_NEXT, ICO_STOP,
-    ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_MINUS, ICO_SORT, ICO_REFRESH
+    ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_MINUS, ICO_SORT, ICO_REFRESH,
+    ICO_ORDER, ICO_SHUFFLE, ICO_REPEATONE, ICO_PLAYONCE, ICO_FOLDER
 };
 
 /* 在按钮矩形内绘制单个矢量图标 */
@@ -1975,7 +2085,7 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
     int x0 = rc->left + (w - s) / 2;
     int y0 = rc->top + (h - s) / 2;
     int cy = y0 + s / 2;
-    COLORREF col = RGB(45, 45, 45);
+    COLORREF col = RGB(120, 120, 120);
     HPEN pen2 = CreatePen(PS_SOLID, 2, col);
     HPEN pen3 = CreatePen(PS_SOLID, 3, col);
     HPEN pen1 = CreatePen(PS_SOLID, 1, col);
@@ -2010,18 +2120,18 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
     }
     case ICO_MUTE:
     case ICO_MUTED: {
-        /* 喇叭：左侧小矩形 + 锥形纸盆 */
+        /* 喇叭整体左移，音波弧收在 16px 图标盒内，避免被按钮边缘裁掉 */
         POINT cone[6] = {
-            {x0+5,y0+5},{x0+9,y0+5},{x0+14,y0+1},
-            {x0+14,y0+s-1},{x0+9,y0+s-5},{x0+5,y0+s-5} };
-        Rectangle(hdc, x0+2, y0+5, x0+5, y0+s-5);
+            {x0+3,y0+5},{x0+7,y0+5},{x0+12,y0+1},
+            {x0+12,y0+s-1},{x0+7,y0+s-5},{x0+3,y0+s-5} };
+        Rectangle(hdc, x0+1, y0+5, x0+4, y0+s-5);
         Polygon(hdc, cone, 6);
         if (kind == ICO_MUTE) {
-            /* 两道声波弧（开口朝右，±55° 五点折线近似） */
+            /* 两道声波弧（开口朝右） */
             SelectObject(hdc, pen2);
             {
-                POINT a1[5] = { {x0+15,y0+5},{x0+16,y0+7},{x0+17,cy},{x0+16,y0+s-7},{x0+15,y0+s-5} };
-                POINT a2[5] = { {x0+17,y0+3},{x0+19,y0+5},{x0+20,cy},{x0+19,y0+s-5},{x0+17,y0+s-3} };
+                POINT a1[5] = { {x0+12,y0+5},{x0+14,y0+7},{x0+14,cy},{x0+14,y0+s-7},{x0+12,y0+s-5} };
+                POINT a2[5] = { {x0+14,y0+3},{x0+15,y0+6},{x0+15,cy},{x0+15,y0+s-6},{x0+14,y0+s-3} };
                 Polyline(hdc, a1, 5);
                 Polyline(hdc, a2, 5);
             }
@@ -2029,8 +2139,8 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
             /* 静音：喇叭右侧红叉 */
             HPEN rp = CreatePen(PS_SOLID, 2, RGB(200, 40, 40));
             SelectObject(hdc, rp);
-            MoveToEx(hdc, x0+12, y0+3, NULL); LineTo(hdc, x0+20, y0+s-3);
-            MoveToEx(hdc, x0+20, y0+3, NULL); LineTo(hdc, x0+12, y0+s-3);
+            MoveToEx(hdc, x0+11, y0+3, NULL); LineTo(hdc, x0+16, y0+s-3);
+            MoveToEx(hdc, x0+16, y0+3, NULL); LineTo(hdc, x0+11, y0+s-3);
             DeleteObject(rp);
         }
         break;
@@ -2081,6 +2191,72 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
         }
         break;
     }
+    case ICO_ORDER: {
+        /* 顺序播放：三条横线 + 右下播放三角 */
+        SelectObject(hdc, pen2);
+        MoveToEx(hdc, x0+2, y0+4, NULL);  LineTo(hdc, x0+11, y0+4);
+        MoveToEx(hdc, x0+2, y0+8, NULL);  LineTo(hdc, x0+11, y0+8);
+        MoveToEx(hdc, x0+2, y0+12, NULL); LineTo(hdc, x0+8,  y0+12);
+        {
+            POINT t[3] = { {x0+10,y0+9},{x0+10,y0+s-1},{x0+s-2,cy+1} };
+            Polygon(hdc, t, 3);
+        }
+        break;
+    }
+    case ICO_SHUFFLE: {
+        /* 随机播放：两条交叉的折线箭头 */
+        SelectObject(hdc, pen2);
+        MoveToEx(hdc, x0+2, y0+3, NULL);
+        LineTo(hdc, x0+7, y0+3); LineTo(hdc, x0+11, cy); LineTo(hdc, x0+7, y0+s-3); LineTo(hdc, x0+2, y0+s-3);
+        MoveToEx(hdc, x0+9, y0+3, NULL);
+        LineTo(hdc, x0+13, y0+3); LineTo(hdc, x0+9, cy); LineTo(hdc, x0+13, y0+s-3);
+        /* 右箭头 */
+        MoveToEx(hdc, x0+11, y0+s-3, NULL); LineTo(hdc, x0+s-2, y0+s-3);
+        {
+            POINT ah[3] = { {x0+s-5,y0+s-6},{x0+s-2,y0+s-3},{x0+s-5,y0+s} };
+            SelectObject(hdc, pen1);
+            Polygon(hdc, ah, 3);
+        }
+        break;
+    }
+    case ICO_REPEATONE: {
+        /* 单曲循环：上下回环箭头 + 中间数字 1 */
+        SelectObject(hdc, pen2);
+        MoveToEx(hdc, x0+5, y0+4, NULL);
+        LineTo(hdc, x0+s-4, y0+4); LineTo(hdc, x0+s-4, y0+8);
+        LineTo(hdc, x0+s-7, y0+8);
+        {
+            POINT ah[3] = { {x0+s-10,y0+5},{x0+s-7,y0+8},{x0+s-10,y0+11} };
+            Polygon(hdc, ah, 3);
+        }
+        MoveToEx(hdc, x0+s-5, y0+s-4, NULL);
+        LineTo(hdc, x0+4, y0+s-4); LineTo(hdc, x0+4, y0+s-8);
+        LineTo(hdc, x0+7, y0+s-8);
+        {
+            POINT ah2[3] = { {x0+10,y0+s-5},{x0+7,y0+s-8},{x0+10,y0+s-11} };
+            Polygon(hdc, ah2, 3);
+        }
+        /* 中间 1 */
+        SelectObject(hdc, pen3);
+        MoveToEx(hdc, x0+s/2, y0+6, NULL); LineTo(hdc, x0+s/2, y0+s-6);
+        break;
+    }
+    case ICO_PLAYONCE: {
+        /* 一次性播放：播放三角 + 右侧竖线（播放到此为止） */
+        POINT t[3] = { {x0+2,y0+2},{x0+2,y0+s-2},{x0+s-7,cy} };
+        Polygon(hdc, t, 3);
+        SelectObject(hdc, pen3);
+        MoveToEx(hdc, x0+s-4, y0+3, NULL); LineTo(hdc, x0+s-4, y0+s-3);
+        break;
+    }
+    case ICO_FOLDER: {
+        /* 目录文件夹 */
+        POINT pts[6] = {
+            {x0+1,y0+5},{x0+5,y0+5},{x0+7,y0+3},{x0+s-2,y0+3},
+            {x0+s-2,y0+s-2},{x0+1,y0+s-2} };
+        Polygon(hdc, pts, 6);
+        break;
+    }
     }
 
     SelectObject(hdc, op);
@@ -2121,8 +2297,231 @@ static int IconKindOf(int id, int *on)
     case IDC_BTN_DEL:   *on = (g_podMode == 1); return ICO_MINUS;
     case IDC_BTN_SORT:  *on = (g_podMode == 2); return ICO_SORT;
     case IDC_BTN_REFRESH: return ICO_REFRESH;
+    case IDC_BTN_PLAYMODE:
+        return (g_playMode == 1) ? ICO_SHUFFLE :
+               (g_playMode == 2) ? ICO_REPEATONE :
+               (g_playMode == 3) ? ICO_PLAYONCE : ICO_ORDER;
+    case IDC_BTN_DIR:   return ICO_FOLDER;
     }
     return -1;
+}
+
+/* ================= 缓存目录管理 ================= */
+/* 统计某目录下 .mp3 文件数量 */
+static int CountMp3InDir(const wchar_t *dir)
+{
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int n = 0;
+    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++; }
+    while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+/* 把旧目录里所有 .mp3 移动到新目录 */
+static void MoveMp3Files(const wchar_t *oldDir, const wchar_t *newDir)
+{
+    wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    swprintf(pat, MAX_PATH, L"%s*.mp3", oldDir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        swprintf(src, MAX_PATH, L"%s%s", oldDir, fd.cFileName);
+        swprintf(dst, MAX_PATH, L"%s%s", newDir, fd.cFileName);
+        MoveFileW(src, dst);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+/* 目录按钮：弹出菜单，可打开当前缓存目录或更改缓存目录 */
+static void OnDirButton(void)
+{
+    HMENU menu = CreatePopupMenu();
+    POINT pt;
+    int cmd;
+    wchar_t curDir[MAX_PATH];
+
+    AppendMenuW(menu, MF_STRING, 1, L"打开缓存目录");
+    AppendMenuW(menu, MF_STRING, 2, L"更改缓存目录...");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, 3, L"恢复默认目录");
+
+    GetCursorPos(&pt);
+    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(menu);
+    if (cmd == 0) return;
+
+    CacheDir(curDir, MAX_PATH);
+    curDir[wcslen(curDir) - 1] = 0;   /* 去末尾反斜杠便于浏览 */
+
+    if (cmd == 1) {
+        ShellExecuteW(g_hwnd, L"open", curDir, NULL, NULL, SW_SHOWNORMAL);
+    } else if (cmd == 2) {
+        BROWSEINFOW bi;
+        LPITEMIDLIST pidl;
+        wchar_t newPath[MAX_PATH] = L"";
+        ZeroMemory(&bi, sizeof(bi));
+        bi.hwndOwner = g_hwnd;
+        bi.lpszTitle = L"选择缓存目录";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        pidl = SHBrowseForFolderW(&bi);
+        if (pidl && SHGetPathFromIDListW(pidl, newPath)) {
+            int oldHasFiles = CountMp3InDir(curDir);
+            wchar_t newDir[MAX_PATH];
+            swprintf(newDir, MAX_PATH, L"%s\\", newPath);
+            /* 若旧目录有缓存，询问是否移动 */
+            if (oldHasFiles > 0) {
+                wchar_t msg[256];
+                swprintf(msg, 256, L"当前缓存目录有 %d 个音频文件，是否移动到新目录？", oldHasFiles);
+                if (MessageBoxW(g_hwnd, msg, L"移动缓存", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    wchar_t oldDir[MAX_PATH];
+                    CacheDir(oldDir, MAX_PATH);
+                    EnsureCacheDir();
+                    MoveMp3Files(oldDir, newDir);
+                }
+            }
+            wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
+            g_cacheDir[MAX_PATH - 1] = 0;
+            EnsureCacheDir();
+            SetStatus(L"缓存目录已更改");
+        }
+        if (pidl) CoTaskMemFree(pidl);
+    } else if (cmd == 3) {
+        g_cacheDir[0] = 0;
+        EnsureCacheDir();
+        SetStatus(L"缓存目录已恢复默认");
+    }
+}
+
+/* ================= 工具提示 ================= */
+/* 给按钮加一条固定文本的系统 tooltip（不使用 TTF_SUBCLASS，
+ * 改由 PanelProc 转发鼠标消息，避免与自管子类化冲突） */
+static void AddButtonTip(HWND btn, const wchar_t *text)
+{
+    TOOLINFOW ti;
+    if (!g_hwndTip || !btn) return;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_IDISHWND;
+    ti.hwnd = GetParent(btn);
+    ti.uId = (UINT_PTR)btn;
+    ti.lpszText = (LPWSTR)text;
+    SendMessageW(g_hwndTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+static const wchar_t* PlayModeTipText(void)
+{
+    return g_playMode == 1 ? L"随机播放" :
+           g_playMode == 2 ? L"单曲循环" :
+           g_playMode == 3 ? L"一次性播放" : L"顺序播放";
+}
+
+/* 切换播放模式并刷新按钮图标 + 按钮 tooltip（不改动状态行） */
+static void CyclePlayMode(void)
+{
+    g_playMode = (g_playMode + 1) % 4;
+    InvalidateRect(g_btnPlayMode, NULL, TRUE);
+    if (g_hwndTip) {
+        TOOLINFOW ti; ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_IDISHWND;
+        ti.hwnd = g_hwnd;
+        ti.uId = (UINT_PTR)g_btnPlayMode;
+        ti.lpszText = (LPWSTR)PlayModeTipText();
+        SendMessageW(g_hwndTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    }
+}
+
+/* 播客自定义提示窗过程：左侧封面，右侧标题+作者 */
+static LRESULT CALLBACK PodTipProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_INFOBK));
+        DrawEdge(hdc, &rc, EDGE_RAISED, BF_RECT);
+        if (g_tipPodIdx >= 0 && g_tipPodIdx < g_podCount) {
+            Podcast *p = &g_pods[g_tipPodIdx];
+            int pad = 8;
+            RECT rci = { pad, pad, pad + 96, pad + 96 };
+            RECT rct = { pad + 96 + 12, pad + 4, rc.right - pad, pad + 28 };
+            RECT rca = { pad + 96 + 12, pad + 30, rc.right - pad, pad + 56 };
+            RECT rcd = { pad + 96 + 12, pad + 58, rc.right - pad, rc.bottom - pad };
+            /* 封面：保持比例绘制，黑底占位 */
+            if (p->hImage) {
+                BITMAP bm;
+                HDC mem = CreateCompatibleDC(hdc);
+                HBITMAP old = (HBITMAP)SelectObject(mem, p->hImage);
+                GetObject(p->hImage, sizeof(bm), &bm);
+                if (bm.bmWidth > 0 && bm.bmHeight > 0) {
+                    double r1 = 96.0 / bm.bmWidth, r2 = 96.0 / bm.bmHeight;
+                    double r = r1 < r2 ? r1 : r2;
+                    int dw = (int)(bm.bmWidth * r + 0.5);
+                    int dh = (int)(bm.bmHeight * r + 0.5);
+                    int dx = rci.left + (96 - dw) / 2;
+                    int dy = rci.top + (96 - dh) / 2;
+                    HBRUSH bk = CreateSolidBrush(RGB(0,0,0));
+                    FillRect(hdc, &rci, bk);
+                    DeleteObject(bk);
+                    SetStretchBltMode(hdc, HALFTONE);
+                    StretchBlt(hdc, dx, dy, dw, dh, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+                }
+                SelectObject(mem, old);
+                DeleteDC(mem);
+            } else {
+                HBRUSH bk = CreateSolidBrush(RGB(210,210,210));
+                FillRect(hdc, &rci, bk);
+                DeleteObject(bk);
+            }
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, GetSysColor(COLOR_INFOTEXT));
+            SelectObject(hdc, g_fontBold);
+            DrawTextW(hdc, p->title ? p->title : L"(无标题)", -1, &rct,
+                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            SelectObject(hdc, g_fontSmall);
+            DrawTextW(hdc, p->author ? p->author : L"", -1, &rca,
+                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            if (p->desc)
+                DrawTextW(hdc, p->desc, -1, &rcd,
+                    DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+/* 根据鼠标在播客列表中的位置，更新并显示自定义播客提示 */
+static void UpdatePodTipFromPoint(POINT pt)
+{
+    int idx;
+    RECT irc;
+    POINT screen;
+    if (g_podMode != 0) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
+    idx = (int)SendMessageW(g_listPod, LB_ITEMFROMPOINT, 0, MAKELPARAM(pt.x, pt.y));
+    if (idx < 0 || idx >= g_podCount) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
+    if (idx != g_tipPodIdx) {
+        g_tipPodIdx = idx;
+        InvalidateRect(g_hwndPodTip, NULL, TRUE);
+    }
+    /* 定位到条目右下方，避免遮挡文字 */
+    SendMessageW(g_listPod, LB_GETITEMRECT, idx, (LPARAM)&irc);
+    screen.x = irc.right; screen.y = irc.top;
+    ClientToScreen(g_listPod, &screen);
+    SetWindowPos(g_hwndPodTip, HWND_TOPMOST, screen.x + 6, screen.y, 0, 0,
+        SWP_NOSIZE | SWP_NOACTIVATE);
+    ShowWindow(g_hwndPodTip, SW_SHOWNA);
 }
 
 /* ================= 窗口过程 ================= */
@@ -2147,16 +2546,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | SS_RIGHT,
             0,0,0,0, hwnd, (HMENU)IDC_ST_TIME, NULL, NULL);
 
-        /* 第三行：全图标方形按钮 */
+        /* 全部方形图标按钮 */
         {
-            const int ids[9] = {
+            const int ids[11] = {
                 IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
-                IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH };
-            HWND *p[9] = {
+                IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
+                IDC_BTN_DIR };
+            HWND *p[11] = {
                 &g_btnPrev, &g_btnPlay, &g_btnNext, &g_btnStop, &g_btnMute,
-                &g_btnAdd, &g_btnDel, &g_btnSort, &g_btnRefresh };
+                &g_btnAdd, &g_btnDel, &g_btnSort, &g_btnRefresh, &g_btnPlayMode,
+                &g_btnDir };
             int bi;
-            for (bi = 0; bi < 9; bi++)
+            for (bi = 0; bi < 11; bi++)
                 *p[bi] = CreateWindowExW(0, L"BUTTON", NULL,
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                     0,0,0,0, hwnd, (HMENU)(INT_PTR)ids[bi], NULL, NULL);
@@ -2169,7 +2570,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessageW(g_sldVol, TBM_SETPOS, TRUE, g_volume);
         {
             wchar_t vt[8];
-            swprintf(vt, 8, L"%d%%", g_volume);
+            swprintf(vt, 8, L"%d", g_volume);
             g_stVol = CreateWindowExW(0, L"STATIC", vt,
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                 0,0,0,0, hwnd, (HMENU)IDC_ST_VOL, NULL, NULL);
@@ -2229,8 +2630,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnDel);
         SubclassForFontWheel(g_btnSort);
         SubclassForFontWheel(g_btnRefresh);
+        SubclassForFontWheel(g_btnPlayMode);
+        SubclassForFontWheel(g_btnDir);
 
         SetTimer(hwnd, 1, 500, NULL);
+
+        /* 系统工具提示：按钮 + 剧集条目 */
+        g_hwndTip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
+            WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            hwnd, NULL, GetModuleHandleW(NULL), NULL);
+        if (g_hwndTip) {
+            SetWindowPos(g_hwndTip, HWND_TOPMOST, 0,0,0,0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            AddButtonTip(g_btnPrev,   L"上一首");
+            AddButtonTip(g_btnPlay,   L"播放 / 暂停");
+            AddButtonTip(g_btnNext,   L"下一首");
+            AddButtonTip(g_btnStop,   L"停止");
+            AddButtonTip(g_btnMute,   L"静音");
+            AddButtonTip(g_btnAdd,    L"添加播客");
+            AddButtonTip(g_btnDel,    L"删除播客");
+            AddButtonTip(g_btnSort,   L"调整顺序");
+            AddButtonTip(g_btnRefresh,L"刷新");
+            AddButtonTip(g_btnPlayMode, PlayModeTipText());
+            AddButtonTip(g_btnDir,    L"缓存目录");
+            /* 剧集列表：悬停时按需返回完整文本 */
+            {
+                TOOLINFOW ti; ZeroMemory(&ti, sizeof(ti));
+                ti.cbSize = sizeof(ti);
+                ti.uFlags = TTF_IDISHWND;
+                ti.hwnd = hwnd;
+                ti.uId = (UINT_PTR)g_listEp;
+                ti.lpszText = LPSTR_TEXTCALLBACKW;
+                SendMessageW(g_hwndTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
+        }
+
+        /* 自定义播客提示窗（封面 + 标题 + 作者） */
+        {
+            WNDCLASSEXW wc; ZeroMemory(&wc, sizeof(wc));
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = PodTipProc;
+            wc.hInstance = GetModuleHandleW(NULL);
+            wc.lpszClassName = L"LpPodTip";
+            wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+            wc.hbrBackground = (HBRUSH)(COLOR_INFOBK + 1);
+            RegisterClassExW(&wc);
+            g_hwndPodTip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                L"LpPodTip", NULL, WS_POPUP, 0,0, 320, 140, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+        }
         return 0;
     }
 
@@ -2260,10 +2708,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             FillRect(di->hDC, &rc, bg);
             DeleteObject(bg);
 
-            /* 封面区：50x50，左/上各留 2px。
+            /* 封面区：48x48，左留 2px、上留 3px。
              * 删除模式 → 大红叉按钮；排序模式 → 左右两个上/下箭头按钮 */
             if (g_podMode == 1) {
-                RECT xb = { rc.left + 2, rc.top + 2, rc.left + 52, rc.top + 52 };
+                RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
                 HPEN rp = CreatePen(PS_SOLID, 5, RGB(205, 40, 40));
                 HGDIOBJ oldp = SelectObject(di->hDC, rp);
                 FillRect(di->hDC, &xb, (HBRUSH)GetStockObject(WHITE_BRUSH));
@@ -2274,17 +2722,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 LineTo(di->hDC, xb.left + 8, xb.bottom - 8);
                 SelectObject(di->hDC, oldp);
                 DeleteObject(rp);
-                textLeft = rc.left + 58;
+                textLeft = rc.left + 56;
             } else if (g_podMode == 2) {
-                RECT rL = { rc.left + 2, rc.top + 2, rc.left + 27, rc.top + 52 };
-                RECT rR = { rc.left + 27, rc.top + 2, rc.left + 52, rc.top + 52 };
+                RECT rL = { rc.left + 2, rc.top + 3, rc.left + 25, rc.top + 51 };
+                RECT rR = { rc.left + 25, rc.top + 3, rc.left + 50, rc.top + 51 };
                 HBRUSH fb = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
-                HPEN dp = CreatePen(PS_SOLID, 1, RGB(45, 45, 45));
-                HBRUSH db = CreateSolidBrush(RGB(45, 45, 45));
+                HPEN dp = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
+                HBRUSH db = CreateSolidBrush(RGB(120, 120, 120));
                 HGDIOBJ op = SelectObject(di->hDC, dp);
                 HGDIOBJ ob = SelectObject(di->hDC, db);
-                POINT up[3]   = { {rc.left + 7, rc.top + 33}, {rc.left + 21, rc.top + 33}, {rc.left + 14, rc.top + 19} };
-                POINT down[3] = { {rc.left + 33, rc.top + 21}, {rc.left + 47, rc.top + 21}, {rc.left + 40, rc.top + 35} };
+                POINT up[3]   = { {rc.left + 7, rc.top + 33}, {rc.left + 20, rc.top + 33}, {rc.left + 13, rc.top + 19} };
+                POINT down[3] = { {rc.left + 30, rc.top + 21}, {rc.left + 43, rc.top + 21}, {rc.left + 36, rc.top + 35} };
                 FillRect(di->hDC, &rL, fb);
                 FillRect(di->hDC, &rR, fb);
                 DrawEdge(di->hDC, &rL, EDGE_RAISED, BF_RECT);
@@ -2296,25 +2744,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DeleteObject(dp);
                 DeleteObject(db);
                 DeleteObject(fb);
-                textLeft = rc.left + 58;
+                textLeft = rc.left + 56;
             } else if (p->hImage) {
+                BITMAP bm;
                 HDC mem = CreateCompatibleDC(di->hDC);
                 HBITMAP old = (HBITMAP)SelectObject(mem, p->hImage);
-                BitBlt(di->hDC, rc.left + 2, rc.top + 2, 50, 50, mem, 0, 0, SRCCOPY);
+                GetObject(p->hImage, sizeof(bm), &bm);
+                SetStretchBltMode(di->hDC, HALFTONE);
+                StretchBlt(di->hDC, rc.left + 2, rc.top + 3, 48, 48,
+                           mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
                 SelectObject(mem, old);
                 DeleteDC(mem);
-                textLeft = rc.left + 58;
+                textLeft = rc.left + 56;
             } else {
                 textLeft = rc.left + 6;
             }
 
             SetBkMode(di->hDC, TRANSPARENT);
 
-            /* 标题：10pt 加粗，顶部对齐，播放中绿色 */
+            /* 标题：加粗，播放中绿色 */
             {
                 RECT rct = rc;
                 rct.left = textLeft;
-                rct.right = rc.right - 34;
+                rct.right = rc.right - 28;
                 rct.top += 3;
                 rct.bottom = rct.top + 22;
                 SetTextColor(di->hDC, isPlaying ? RGB(0,140,60) : RGB(20,20,20));
@@ -2323,13 +2775,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
 
-            /* 副标题：copyright（空则 author），8pt 灰色，标题下方 */
+            /* 副标题：copyright（空则 author），小字号灰色，标题下方 */
             {
                 const wchar_t *sub = p->copyright ? p->copyright : p->author;
                 if (sub && *sub) {
                     RECT rcs = rc;
                     rcs.left = textLeft;
-                    rcs.right = rc.right - 34;
+                    rcs.right = rc.right - 28;
                     rcs.top += 26;
                     rcs.bottom = rcs.top + 24;
                     SetTextColor(di->hDC, RGB(110,110,110));
@@ -2339,14 +2791,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
 
-            /* 右侧：纯数字（剧集数） */
+            /* 右侧：剧集数（小一号字体） */
             {
                 wchar_t cnt[16];
                 RECT rc2 = di->rcItem;
                 swprintf(cnt, 16, L"%d", p->epCount);
                 SetTextColor(di->hDC, isSel ? RGB(40,40,40) : RGB(120,120,120));
-                SelectObject(di->hDC, g_font);
-                rc2.left = rc2.right - 32;
+                SelectObject(di->hDC, g_fontSmall);
+                rc2.left = rc2.right - 26;
                 rc2.right -= 4;
                 DrawTextW(di->hDC, cnt, -1, &rc2,
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -2507,6 +2959,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_NCCALCSIZE: {
+        /* 窄边框：让 DefWindowProc 算出默认非客户区后，把客户区向外扩几像素，
+         * 压薄左右下三边的可见边框（标题栏保留）。尺寸拖拽仍由原命中区负责。 */
+        if (wParam == TRUE) {
+            NCCALCSIZE_PARAMS *ncp = (NCCALCSIZE_PARAMS*)lParam;
+            DefWindowProcW(hwnd, WM_NCCALCSIZE, wParam, lParam);
+            ncp->rgrc[0].left   -= 4;
+            ncp->rgrc[0].right  += 4;
+            ncp->rgrc[0].bottom += 4;
+            return 0;
+        }
+        break;
+    }
+
     case WM_COMMAND:
         if (HIWORD(wParam) == LBN_SELCHANGE) {
             if (LOWORD(wParam) == IDC_LIST_POD)
@@ -2526,11 +2992,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_DEL) SetPodMode(1);
             else if (id == IDC_BTN_SORT) SetPodMode(2);
             else if (id == IDC_BTN_REFRESH) ReloadFeeds();
+            else if (id == IDC_BTN_PLAYMODE) CyclePlayMode();
+            else if (id == IDC_BTN_DIR) OnDirButton();
         }
         return 0;
 
     case WM_NOTIFY: {
         NMHDR *nm = (NMHDR*)lParam;
+        if (nm->code == TTN_GETDISPINFOW && nm->hwndFrom == g_hwndTip) {
+            /* 剧集条目悬停提示：返回鼠标所在列的完整文本 */
+            LPNMTTDISPINFOW nmtd = (LPNMTTDISPINFOW)lParam;
+            POINT pt;
+            LVHITTESTINFO ht;
+            GetCursorPos(&pt);
+            ScreenToClient(g_listEp, &pt);
+            ht.pt = pt;
+            ht.flags = 0;
+            if (ListView_HitTest(g_listEp, &ht) >= 0 && ht.iItem >= 0 &&
+                ht.iSubItem >= 0 && ht.iSubItem <= 2) {
+                wchar_t txt[512];
+                LVITEMW lvi;
+                ZeroMemory(&lvi, sizeof(lvi));
+                lvi.iItem = ht.iItem;
+                lvi.iSubItem = ht.iSubItem;
+                lvi.pszText = txt;
+                lvi.cchTextMax = 512;
+                if (ListView_GetItem(g_listEp, &lvi) && txt[0]) {
+                    static wchar_t s_buf[512];
+                    wcsncpy(s_buf, txt, 511); s_buf[511] = 0;
+                    nmtd->lpszText = s_buf;
+                    return 0;
+                }
+            }
+            nmtd->lpszText = L"";
+            return 0;
+        }
         if (nm->code == HDN_ITEMCLICKW) {   /* Unicode 窗口只会收到 W 版通知 */
             LPNMHEADERW hdr = (LPNMHEADERW)lParam;
             HWND hv = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
@@ -2545,6 +3041,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
                                             (WPARAM)-1, LVNI_SELECTED);
                 if (sel >= 0) RequestPlayEpisode(g_curPod, sel);
+            } else if (nm->code == NM_CUSTOMDRAW) {
+                /* 正在播放 → 绿；已缓存（非播放）→ 黄 */
+                LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
+                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) {
+                    return CDRF_NOTIFYITEMDRAW;   /* 必须，否则收不到 ITEMPREPAINT */
+                } else if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                    int i = (int)cd->nmcd.dwItemSpec;
+                    int playing = (g_playPod == g_curPod && g_curEp == i && g_playState == 1);
+                    if (playing) {
+                        cd->clrText = RGB(0, 150, 70);
+                    } else if (g_curPod >= 0 && g_curPod < g_podCount &&
+                               i >= 0 && i < g_pods[g_curPod].epCount &&
+                               EpisodeIsCached(&g_pods[g_curPod].eps[i])) {
+                        cd->clrText = RGB(190, 155, 0);
+                    }
+                    return CDRF_NEWFONT;
+                }
             }
         }
         return 0;
@@ -2555,7 +3068,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             wchar_t buf[16];
             int v = (int)SendMessageW(g_sldVol, TBM_GETPOS, 0, 0);
             g_volume = v;
-            swprintf(buf, 16, L"%d%%", v);
+            swprintf(buf, 16, L"%d", v);
             SetWindowTextW(g_stVol, buf);
             if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
             /* 手动调音量时自动解除静音 */
@@ -2623,11 +3136,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_APP_FEED_ADDED: {
         Podcast *pod = (Podcast*)lParam;
+        int incremental = (int)wParam;   /* 1=单条添加，0=全量刷新 */
         if (pod) {
             if (g_podCount < MAX_PODCASTS) {
+                int newIdx = g_podCount;
                 g_pods[g_podCount] = *pod;
                 SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)pod->title);
                 g_podCount++;
+                /* 单条添加：自动选中新条目，让用户立即看到剧集 */
+                if (incremental) {
+                    SendMessageW(g_listPod, LB_SETCURSEL, newIdx, 0);
+                    SelectPodcast(newIdx);
+                }
             } else {
                 FreePodcast(pod);   /* 超过上限：丢弃并释放 */
             }
@@ -2640,8 +3160,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_feedsLoading = 0;
         if (g_podCount > 0) {
             SetStatus(L"就绪");
-            SendMessageW(g_listPod, LB_SETCURSEL, 0, 0);
-            SelectPodcast(0);
+            /* 单条添加时新条目已在 FEED_ADDED 中选中；全量刷新则默认第一条 */
+            if (SendMessageW(g_listPod, LB_GETCURSEL, 0, 0) == LB_ERR) {
+                SendMessageW(g_listPod, LB_SETCURSEL, 0, 0);
+                SelectPodcast(0);
+            }
         } else {
             SetStatus(L"还没有订阅，点左下角「+」按钮添加 RSS 播客");
         }
@@ -2682,6 +3205,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             free(r->url);
             free(r);
         }
+        InvalidateRect(g_listEp, NULL, TRUE);   /* 下载完成 → 缓存标记变黄 */
         return 0;
     }
 
@@ -2703,6 +3227,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 d = PlayerGet100ns(1);
                 if (d > 0) g_dur100ns = d;
                 InvalidateRect(g_listPod, NULL, TRUE);   /* 标题变绿 */
+                InvalidateRect(g_listEp, NULL, TRUE);    /* 剧集变绿 */
             }
             break;
         case MFP_EVENT_TYPE_PAUSE:
@@ -2710,12 +3235,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_playState = 2;
                 InvalidateRect(g_btnPlay, NULL, TRUE);   /* 图标变回“播放” */
                 InvalidateRect(g_listPod, NULL, TRUE);
+                InvalidateRect(g_listEp, NULL, TRUE);
             }
             break;
         case MFP_EVENT_TYPE_PLAYBACK_ENDED:
-            PlayerStop();
-            SetStatus(L"播放完毕");
+            if (g_playMode == 2) {
+                /* 单曲循环：重新播放当前集 */
+                if (g_curPod >= 0 && g_curEp >= 0)
+                    RequestPlayEpisode(g_curPod, g_curEp);
+            } else if (g_playMode == 3) {
+                /* 一次性播放：播放完毕即停止 */
+                PlayerStop();
+                SetStatus(L"播放完毕");
+            } else if (g_curPod >= 0 && g_curEp >= 0 &&
+                       g_pods[g_curPod].epCount > 1) {
+                /* 顺序/随机：自动下一曲 */
+                PlayAdjacent(+1);
+            } else {
+                PlayerStop();
+                SetStatus(L"播放完毕");
+            }
             InvalidateRect(g_listPod, NULL, TRUE);
+            InvalidateRect(g_listEp, NULL, TRUE);
             break;
         case MFP_EVENT_TYPE_ERROR:
             SetStatus(L"播放出错");
@@ -2769,9 +3310,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     icc.dwSize = sizeof(icc);
     icc.dwICC  = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
+    srand((unsigned)GetTickCount());
 
     /* 建窗前读取配置：排序/列宽/音量/窗口尺寸 */
     LoadConfig(1);
+    EnsureCacheDir();   /* 配置里可能有自定义缓存目录，先确保存在 */
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
