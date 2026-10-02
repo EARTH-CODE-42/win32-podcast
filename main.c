@@ -59,12 +59,13 @@
 typedef struct {
     wchar_t *title;
     wchar_t *desc;
-    wchar_t *url;        /* enclosure URL */
-    wchar_t *author;     /* itunes:author */
+    wchar_t *url;        /* enclosure URL（离线视图里是本地 mp3 完整路径） */
+    wchar_t *author;     /* itunes:author（离线视图里是播客名称） */
     wchar_t  dateText[24];
     long long dateKey;   /* YYYYMMDDHHMM 分钟级，0=未知 */
     int      durationSec;
     int      origIdx;    /* RSS 原始顺序，排序 tiebreak */
+    int      localFile;  /* 1=离线缓存视图：url 为本地路径，直接播放不联网 */
 } Episode;
 
 typedef struct {
@@ -106,6 +107,12 @@ enum {
 static Podcast  g_pods[MAX_PODCASTS];
 static int      g_podCount = 0;
 static int      g_curPod = -1, g_curEp = -1;
+
+/* “已缓存”虚拟播客：聚合当前缓存目录里所有 mp3，断网也可浏览播放。
+ * 固定挂在播客列表最后一行，下标哨兵 = g_podCount */
+static Podcast  g_cachePod;
+static int      g_viewCached = 0;     /* 剧集列表当前是否为缓存视图 */
+static int      g_cacheRowHere = 0;   /* 列表框里是否已追加“已缓存”行 */
 
 static HWND     g_hwnd;
 static HFONT    g_font;          /* 8pt+级别 常规 */
@@ -155,6 +162,7 @@ static ULONG_PTR g_gdipToken = 0;
 
 static volatile int g_feedsLoading = 0;
 static volatile int g_downloading  = 0;
+static int      g_fullReload = 0;    /* 本次加载是否为全量刷新（区别于单条添加） */
 
 /* 播放 */
 static IMFPMediaPlayer *g_player = NULL;
@@ -829,6 +837,192 @@ static int EpisodeIsCached(Episode *e)
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
+/* ================= 缓存元数据（离线“已缓存”视图用） ================= */
+/* 前置声明：离线视图要复用排序/列设置/缓存统计（定义在后面） */
+static void SortPodcast(Podcast *p);
+static void SetEpisodeColumns(int cached);
+static int  CountMp3InDir(const wchar_t *dir);
+static void FreePodcast(Podcast *p);
+/* 每个缓存音频旁边放一个同名 .nfo（UTF-8 文本），记录播客名/标题/时长等，
+ * 这样断网、无订阅时也能列出并播放本地缓存。字段：
+ * pod= 播客名  title= 标题  url= 源地址  dur= 秒  date= 日期文本  key= 日期键 */
+
+/* 把路径扩展名替换成 nfo（缓冲区与源路径同长） */
+static void ReplaceExtNfo(const wchar_t *src, wchar_t *out, int outMax)
+{
+    int len;
+    wcsncpy(out, src, outMax - 1);
+    out[outMax - 1] = 0;
+    len = (int)wcslen(out);
+    if (len >= 4 && out[len - 4] == L'.')
+        wcscpy_s(out + len - 3, outMax - (len - 3), L"nfo");
+}
+
+/* 下载/探测成功后写元数据。durSec<=0 时保留剧集自带时长 */
+static void WriteEpisodeMeta(const wchar_t *podTitle, Episode *e, int durSec)
+{
+    wchar_t mp[MAX_PATH], nfo[MAX_PATH];
+    FILE *f;
+    char *cp, *ct, *cu, *cd;
+    int dur;
+    if (!e || !e->url) return;
+    CachePathFor(e->url, mp, MAX_PATH);
+    ReplaceExtNfo(mp, nfo, MAX_PATH);
+    f = _wfopen(nfo, L"wb");
+    if (!f) return;
+    cp = WToU8(podTitle ? podTitle : L"");
+    ct = WToU8(e->title ? e->title : L"");
+    cu = WToU8(e->url ? e->url : L"");
+    cd = WToU8(e->dateText[0] ? e->dateText : L"");
+    dur = durSec > 0 ? durSec : e->durationSec;
+    /* 标题/名称里的换行由解析端按单行处理，这里也替换成空格避免破坏格式 */
+    if (cp) { char *q; for (q = cp; *q; q++) if (*q == '\r' || *q == '\n') *q = ' '; }
+    if (ct) { char *q; for (q = ct; *q; q++) if (*q == '\r' || *q == '\n') *q = ' '; }
+    if (cd) { char *q; for (q = cd; *q; q++) if (*q == '\r' || *q == '\n') *q = ' '; }
+    fprintf(f, "pod=%s\ntitle=%s\nurl=%s\ndur=%d\ndate=%s\nkey=%lld\n",
+            cp ? cp : "", ct ? ct : "", cu ? cu : "", dur,
+            cd ? cd : "", (long long)e->dateKey);
+    fclose(f);
+    free(cp); free(ct); free(cu); free(cd);
+}
+
+/* 从 .nfo 读一个字段（值无换行）；找到则返回新 malloc 的宽字符串，否则 NULL */
+static wchar_t* NfoField(const wchar_t *nfoPath, const char *key)
+{
+    FILE *f = _wfopen(nfoPath, L"rb");
+    char line[2048];
+    int klen = (int)strlen(key);
+    wchar_t *result = NULL;
+    if (!f) return NULL;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+            char *v = line + klen + 1;
+            int n = (int)strlen(v);
+            while (n > 0 && (v[n-1] == '\r' || v[n-1] == '\n')) v[--n] = 0;
+            result = U8ToW(v);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+static void FreeCachePodcast(void)
+{
+    FreePodcast(&g_cachePod);
+    ZeroMemory(&g_cachePod, sizeof(g_cachePod));
+}
+
+/* 扫描缓存目录，用 mp3+nfo 重建虚拟播客 */
+static void LoadCachePodcast(void)
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind;
+
+    g_cachePod.title  = _wcsdup(L"已缓存");
+    g_cachePod.author = _wcsdup(L"本地缓存音频，断网也可播放");
+
+    CacheDir(dir, MAX_PATH);
+    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
+    hFind = FindFirstFileW(pat, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        Episode *e;
+        wchar_t mp[MAX_PATH], nfo[MAX_PATH], base[MAX_PATH];
+        wchar_t *v;
+        int dot;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+        if (g_cachePod.epCount >= g_cachePod.epCap) {
+            int nc = g_cachePod.epCap ? g_cachePod.epCap * 2 : 16;
+            Episode *ne = (Episode*)realloc(g_cachePod.eps, nc * sizeof(Episode));
+            if (!ne) break;
+            g_cachePod.eps = ne;
+            g_cachePod.epCap = nc;
+        }
+        e = &g_cachePod.eps[g_cachePod.epCount];
+        ZeroMemory(e, sizeof(Episode));
+        e->localFile = 1;
+        e->origIdx = g_cachePod.epCount;
+
+        swprintf(mp, MAX_PATH, L"%s%s", dir, fd.cFileName);
+        e->url = _wcsdup(mp);
+
+        /* 默认标题：去掉扩展名的文件名（哈希名），有 nfo 再覆盖 */
+        wcsncpy(base, fd.cFileName, MAX_PATH - 1);
+        base[MAX_PATH - 1] = 0;
+        dot = (int)wcslen(base);
+        if (dot >= 4) base[dot - 4] = 0;
+        e->title  = _wcsdup(base);
+        e->author = _wcsdup(L"未知播客");
+
+        ReplaceExtNfo(mp, nfo, MAX_PATH);
+        if (GetFileAttributesW(nfo) != INVALID_FILE_ATTRIBUTES) {
+            v = NfoField(nfo, "pod");
+            if (v) { free(e->author); e->author = v; }
+            v = NfoField(nfo, "title");
+            if (v) { free(e->title); e->title = v; }
+            v = NfoField(nfo, "date");
+            if (v && *v) { wcsncpy(e->dateText, v, 23); e->dateText[23] = 0; free(v); }
+            else if (v) free(v);
+            v = NfoField(nfo, "dur");
+            if (v) { e->durationSec = _wtoi(v); free(v); }
+            v = NfoField(nfo, "key");
+            if (v) { e->dateKey = _wtoi64(v); free(v); }
+        }
+        g_cachePod.epCount++;
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    SortPodcast(&g_cachePod);
+}
+
+/* 缓存目录里的 mp3 数量（供列表行右侧显示，避免每次绘制都扫盘） */
+static int g_cacheFileCount = 0;
+
+/* 同步播客列表最后的“已缓存”虚拟行：有缓存才显示 */
+static void RefreshCachedEntry(void)
+{
+    int need, total, has;
+    wchar_t row[64];
+    if (!g_listPod) return;
+    {
+        wchar_t cdir[MAX_PATH];
+        CacheDir(cdir, MAX_PATH);
+        g_cacheFileCount = CountMp3InDir(cdir);
+    }
+    need = g_cacheFileCount > 0;
+    total = (int)SendMessageW(g_listPod, LB_GETCOUNT, 0, 0);
+    has = total > g_podCount;
+    if (need && !has) {
+        int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
+        swprintf(row, 64, L"已缓存 (%d)", g_cacheFileCount);
+        SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)row);
+        g_cacheRowHere = 1;
+        if (sel >= 0) SendMessageW(g_listPod, LB_SETCURSEL, sel, 0);
+    } else if (!need && has) {
+        SendMessageW(g_listPod, LB_DELETESTRING, g_podCount, 0);
+        g_cacheRowHere = 0;
+        if (g_viewCached) {
+            /* 缓存被清空/目录变空：退回普通视图 */
+            g_viewCached = 0;
+            FreeCachePodcast();
+            SetEpisodeColumns(0);
+            SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
+            SetWindowTextW(g_editDesc, L"");
+        }
+    } else if (need && has) {
+        /* 数量可能变化（新增下载/移动目录），更新行文本；保留原选中 */
+        int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
+        swprintf(row, 64, L"已缓存 (%d)", g_cacheFileCount);
+        SendMessageW(g_listPod, LB_DELETESTRING, g_podCount, 0);
+        SendMessageW(g_listPod, LB_INSERTSTRING, g_podCount, (LPARAM)row);
+        if (sel >= 0) SendMessageW(g_listPod, LB_SETCURSEL, sel, 0);
+    }
+}
+
 /* ================= 配置（feeds.ini：订阅源 + 排序 + 布局） ================= */
 static void AddFeedUrl(const char *s)
 {
@@ -1127,6 +1321,7 @@ static void AddSingleFeed(const char *url)
     if (!a->url) { free(a); return; }
     SetStatus(L"正在加载订阅...");
     g_feedsLoading = 1;
+    g_fullReload = 0;
     CreateThread(NULL, 0, SingleFeedLoaderThread, a, 0, NULL);
 }
 
@@ -1337,11 +1532,49 @@ static void PlayerSeekToFrac(int permille)
 }
 
 /* ================= UI 逻辑 ================= */
+/* 切换剧集列表列头：普通=标题/日期/时长；缓存视图=播客/标题/时长 */
+static void SetEpisodeColumns(int cached)
+{
+    static const wchar_t *titlesNormal[3] = { L"标题", L"日期", L"时长" };
+    static const wchar_t *titlesCache[3]  = { L"播客", L"标题", L"时长" };
+    const wchar_t **titles = cached ? titlesCache : titlesNormal;
+    int widths[3], i;
+    if (cached) {
+        RECT rc;
+        GetClientRect(g_listEp, &rc);
+        widths[0] = 84;
+        widths[2] = 46;
+        widths[1] = (rc.right - rc.left) - widths[0] - widths[2] - 24;
+        if (widths[1] < 60) widths[1] = 60;
+    } else {
+        widths[0] = g_colW[0]; widths[1] = g_colW[1]; widths[2] = g_colW[2];
+    }
+    while (SendMessageW(g_listEp, LVM_DELETECOLUMN, 0, 0)) {}
+    for (i = 0; i < 3; i++) {
+        LVCOLUMNW col;
+        ZeroMemory(&col, sizeof(col));
+        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+        col.cx = widths[i];
+        col.iSubItem = i;
+        col.pszText = (wchar_t*)titles[i];
+        SendMessageW(g_listEp, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
+    }
+}
+
+/* 当前剧集列表对应的播客（可能是“已缓存”虚拟播客） */
+static Podcast* ActivePodcast(void)
+{
+    if (g_viewCached) return &g_cachePod;
+    if (g_curPod >= 0 && g_curPod < g_podCount) return &g_pods[g_curPod];
+    return NULL;
+}
+
 /* 用当前播客的剧集填充 ListView（调用前数组应已排序） */
 static void FillEpisodeList(void)
 {
-    Podcast *p = &g_pods[g_curPod];
+    Podcast *p = ActivePodcast();
     int i;
+    if (!p) return;
     SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     for (i = 0; i < p->epCount; i++) {
         wchar_t dur[16];
@@ -1349,11 +1582,16 @@ static void FillEpisodeList(void)
         ZeroMemory(&lvi, sizeof(lvi));
         lvi.mask = LVIF_TEXT;
         lvi.iItem = i;
-        lvi.pszText = p->eps[i].title;
+        /* 缓存视图列序是 播客/标题/时长，普通视图是 标题/日期/时长 */
+        lvi.pszText = g_viewCached
+            ? (p->eps[i].author ? p->eps[i].author : L"")
+            : p->eps[i].title;
         SendMessageW(g_listEp, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
 
         lvi.iSubItem = 1;
-        lvi.pszText = p->eps[i].dateKey ? p->eps[i].dateText : L"";
+        lvi.pszText = g_viewCached
+            ? p->eps[i].title
+            : (p->eps[i].dateKey ? p->eps[i].dateText : L"");
         SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&lvi);
 
         FmtTime(p->eps[i].durationSec, dur, 16);
@@ -1401,27 +1639,58 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
 {
     static wchar_t buf[32768];
     size_t pos = 0;
+    Podcast *p;
     Episode *e;
     wchar_t dur[16];
-    if (podIdx < 0 || podIdx >= g_podCount) return;
-    if (epIdx < 0 || epIdx >= g_pods[podIdx].epCount) return;
-    e = &g_pods[podIdx].eps[epIdx];
+    if (podIdx == g_podCount) p = &g_cachePod;
+    else if (podIdx >= 0 && podIdx < g_podCount) p = &g_pods[podIdx];
+    else return;
+    if (epIdx < 0 || epIdx >= p->epCount) return;
+    e = &p->eps[epIdx];
     buf[0] = 0;
     ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"标题", e->title);
     ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"描述", e->desc);
-    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"作者", e->author);
+    if (g_viewCached)
+        ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"播客", e->author);
+    else
+        ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"作者", e->author);
     if (e->dateKey) ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"发布", e->dateText);
     if (e->durationSec > 0) {
         FmtTime(e->durationSec, dur, 16);
         ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"时长", dur);
     }
-    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, L"链接", e->url);
+    ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos,
+                    e->localFile ? L"本地文件" : L"链接", e->url);
+    SetWindowTextW(g_editDesc, buf);
+}
+
+/* “已缓存”虚拟行被选中：扫描缓存目录，换成 播客/标题/时长 列 */
+static void SelectCachedView(void)
+{
+    static wchar_t buf[256];
+    g_viewCached = 1;
+    g_curPod = g_podCount;
+    FreeCachePodcast();
+    LoadCachePodcast();
+    SetEpisodeColumns(1);
+    FillEpisodeList();
+    swprintf(buf, 256,
+        L"【已缓存】\r\n本地缓存音频共 %d 个，无需联网即可播放。\r\n\r\n"
+        L"缓存内容来自各播客已播放（自动下载）的音频；更改缓存目录可通过右上角文件夹按钮。",
+        g_cachePod.epCount);
     SetWindowTextW(g_editDesc, buf);
 }
 
 static void SelectPodcast(int idx)
 {
+    if (idx == g_podCount) { SelectCachedView(); return; }
     if (idx < 0 || idx >= g_podCount) return;
+    if (g_viewCached) {
+        /* 从缓存视图切回普通播客：恢复列头并释放扫描数据 */
+        g_viewCached = 0;
+        FreeCachePodcast();
+        SetEpisodeColumns(0);
+    }
     g_curPod = idx;
     SortPodcast(&g_pods[idx]);
     FillEpisodeList();
@@ -1430,7 +1699,8 @@ static void SelectPodcast(int idx)
 
 static void SelectEpisode(int idx)
 {
-    if (g_curPod < 0 || idx < 0 || idx >= g_pods[g_curPod].epCount) return;
+    Podcast *p = ActivePodcast();
+    if (!p || idx < 0 || idx >= p->epCount) return;
     g_curEp = idx;
     ShowEpisodeDetail(g_curPod, idx);
 }
@@ -1439,6 +1709,16 @@ static void SelectEpisode(int idx)
 static void ChangeSort(int col)
 {
     int oldOrig = -1, i, sel;
+    Podcast *p;
+    int sortCol;
+
+    if (g_viewCached) {
+        /* 缓存视图列：0=播客(不支持排序) 1=标题 2=时长 */
+        if (col == 1) sortCol = SORT_TITLE;
+        else if (col == 2) sortCol = SORT_DUR;
+        else return;
+        col = sortCol;
+    }
     if (g_sortCol == col) g_sortDir = -g_sortDir;
     else {
         g_sortCol = col;
@@ -1447,14 +1727,16 @@ static void ChangeSort(int col)
     /* 排序只更新内存，退出时统一保存 */
 
     if (g_curPod < 0) return;
+    p = ActivePodcast();
+    if (!p) return;
     sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
-    if (sel >= 0) oldOrig = g_pods[g_curPod].eps[sel].origIdx;
+    if (sel >= 0 && sel < p->epCount) oldOrig = p->eps[sel].origIdx;
 
-    SortPodcast(&g_pods[g_curPod]);
+    SortPodcast(p);
     FillEpisodeList();
 
-    for (i = 0; i < g_pods[g_curPod].epCount; i++) {
-        if (g_pods[g_curPod].eps[i].origIdx == oldOrig) {
+    for (i = 0; i < p->epCount; i++) {
+        if (p->eps[i].origIdx == oldOrig) {
             SendMessageW(g_listEp, LVM_ENSUREVISIBLE, i, FALSE);
             SendMessageW(g_listEp, LVM_SETITEMSTATE, i,
                 (LPARAM)&(LVITEMW){ .state = LVIS_SELECTED|LVIS_FOCUSED,
@@ -1464,11 +1746,48 @@ static void ChangeSort(int col)
     }
 }
 
+/* 离线缓存视图：直接播放本地文件，不联网、不起下载线程 */
+static void PlayLocalEpisode(int ep)
+{
+    Episode *e;
+    wchar_t info[128], st[512];
+    long long pd = 0;
+    LVITEMW lvi;
+    if (ep < 0 || ep >= g_cachePod.epCount) return;
+    e = &g_cachePod.eps[ep];
+
+    if (g_downloading) AbortDownloadConnection();
+    PlayerStop();
+
+    g_playPod = g_podCount;
+    g_curPod = g_podCount;
+    g_curEp = ep;
+    free(g_playUrl);
+    g_playUrl = _wcsdup(e->url);
+
+    ZeroMemory(&lvi, sizeof(lvi));
+    lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    lvi.state = 0;
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
+    lvi.state = LVIS_SELECTED | LVIS_FOCUSED;
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)ep, (LPARAM)&lvi);
+    SendMessageW(g_listEp, LVM_ENSUREVISIBLE, (WPARAM)ep, FALSE);
+
+    ShowEpisodeDetail(g_podCount, ep);
+    ProbeAudio(e->url, info, 128, &pd);
+    g_dur100ns = pd;
+    SetWindowTextW(g_stFormat, info);
+    swprintf(st, 512, L"正在播放（离线）：%s", e->title ? e->title : L"");
+    SetStatus(st);
+    PlayerPlayFile(e->url);
+}
+
 static void RequestPlayEpisode(int pod, int ep)
 {
     DlJob *job;
     Episode *e;
     long myGen;
+    if (pod == g_podCount) { PlayLocalEpisode(ep); return; }
     if (pod < 0 || pod >= g_podCount || ep < 0 || ep >= g_pods[pod].epCount) return;
     e = &g_pods[pod].eps[ep];
 
@@ -1531,8 +1850,8 @@ static void PauseResume(void)
 static void PlayAdjacent(int delta)
 {
     int n, target;
-    if (g_curPod < 0 || g_curPod >= g_podCount) return;
-    n = g_pods[g_curPod].epCount;
+    if (g_curPod < 0) return;
+    n = (g_curPod == g_podCount) ? g_cachePod.epCount : g_pods[g_curPod].epCount;
     if (n <= 0) return;
     if (g_playMode == 1 && n > 1) {
         do { target = rand() % n; } while (target == g_curEp);
@@ -1587,6 +1906,14 @@ static void ReloadFeeds(void)
     if (g_feedsLoading) return;
     if (g_downloading) CancelCurrentDownload();   /* 刷新时中止正在进行的下载 */
     PlayerStop();
+    /* 退出可能正处于的离线“已缓存”视图，列头恢复成 标题/日期/时长 */
+    if (g_viewCached) {
+        g_viewCached = 0;
+        SetEpisodeColumns(0);
+    }
+    FreeCachePodcast();
+    g_cacheRowHere = 0;
+    g_cacheFileCount = 0;
     FreePodcasts();
     SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
     SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
@@ -1595,6 +1922,7 @@ static void ReloadFeeds(void)
     SetStatus(L"正在加载订阅...");
     LoadConfig(0);   /* 只重读订阅列表，界面设置保持当前值 */
     g_feedsLoading = 1;
+    g_fullReload = 1;
     CreateThread(NULL, 0, FeedLoaderThread, NULL, 0, NULL);
 }
 
@@ -1640,6 +1968,7 @@ static char* WToU8(const wchar_t *w)
 static void RemovePodcast(int i)
 {
     int ui;
+    int oldCount = g_podCount;   /* 哨兵 g_playPod/g_curPod 可能等于它（离线播放/缓存视图） */
     if (i < 0 || i >= g_podCount) return;
 
     if (g_playPod == i) {
@@ -1649,7 +1978,8 @@ static void RemovePodcast(int i)
     } else {
         if (g_downloading && g_curDlJob && g_curDlJob->pod == i)
             CancelCurrentDownload();
-        if (g_playPod > i) g_playPod--;
+        if (g_playPod > i && g_playPod < oldCount) g_playPod--;
+        /* g_playPod == oldCount（离线播放中）：哨兵随 g_podCount 自然前移，不动 */
     }
 
     /* 失败的订阅没有对应 pod，按 feedUrl 精确匹配 URL */
@@ -1678,7 +2008,11 @@ static void RemovePodcast(int i)
         g_curPod--;
     }
 
-    if (g_podCount > 0) {
+    if (g_viewCached) {
+        /* 正在离线视图里删真实播客：缓存聚合不受影响，留在“已缓存”行 */
+        g_curPod = g_podCount;
+        SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
+    } else if (g_podCount > 0) {
         int sel = (i >= g_podCount) ? g_podCount - 1 : i;
         SendMessageW(g_listPod, LB_SETCURSEL, (WPARAM)sel, 0);
         SelectPodcast(sel);
@@ -1918,18 +2252,12 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcW(old, hwnd, msg, wp, lp);
 }
 
-/* 内容面板与按钮共用：Ctrl+滚轮调字号 + 转发鼠标消息给 tooltip。
- * 各窗口原始过程存在自己的 GWLP_USERDATA */
+/* 内容面板与按钮共用：Ctrl+滚轮调字号。
+ * 各窗口原始过程存在自己的 GWLP_USERDATA。
+ * tooltip 的鼠标转发统一在 WinMain 消息循环做（TTM_RELAYEVENT） */
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
-    /* 把所有鼠标消息转发给系统 tooltip（替代 TTF_SUBCLASS，
-     * 避免与本过程的 GWLP_WNDPROC 子类化冲突导致提示不显示） */
-    if (g_hwndTip && msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) {
-        MSG m;
-        m.hwnd = hwnd; m.message = msg; m.wParam = wp; m.lParam = lp;
-        SendMessageW(g_hwndTip, TTM_RELAYEVENT, 0, (LPARAM)&m);
-    }
     /* 删除/排序模式下，播客列表的点击全部自管（不允许改选中项） */
     if (hwnd == g_listPod && msg == WM_LBUTTONDOWN && g_podMode != 0) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -2163,32 +2491,42 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
         break;
     }
     case ICO_REFRESH: {
-        /* 约 300° 圆弧 + 末端箭头 */
-        POINT pts[18];
+        /* 标准刷新图标：两段圆弧各带一个箭头，首尾相追围成圆环 */
         double cxx = x0 + s / 2.0 + 0.5, cyy = y0 + s / 2.0 + 0.5, r = 5.6;
         int k;
+        /* arcPts: 沿角度增大方向采样一段弧（屏幕上呈逆时针走笔） */
+        #define LP_ARC(pts, a0, a1, n) do { \
+            for (k = 0; k < (n); k++) { \
+                double deg = (a0) + ((a1) - (a0)) * k / ((n) - 1); \
+                double rad = deg * 3.14159265358979 / 180.0; \
+                (pts)[k].x = (int)(cxx + r * cos(rad) + 0.5); \
+                (pts)[k].y = (int)(cyy - r * sin(rad) + 0.5); \
+            } } while (0)
+        /* 在角度 a 处画一个沿“角度减小”（顺时针）方向的箭头 */
+        #define LP_ARROW(a) do { \
+            double rad = (a) * 3.14159265358979 / 180.0; \
+            double dx = sin(rad), dy = cos(rad);          /* 顺时针切向 */ \
+            double px = -cos(rad), py = sin(rad);         /* 法向 */ \
+            int hx = (int)(cxx + r * cos(rad) + 0.5); \
+            int hy = (int)(cyy - r * sin(rad) + 0.5); \
+            POINT ah2[3]; \
+            ah2[0].x = hx; ah2[0].y = hy; \
+            ah2[1].x = (int)(hx - dx * 5 + px * 3 + 0.5); \
+            ah2[1].y = (int)(hy - dy * 5 + py * 3 + 0.5); \
+            ah2[2].x = (int)(hx - dx * 5 - px * 3 + 0.5); \
+            ah2[2].y = (int)(hy - dy * 5 - py * 3 + 0.5); \
+            Polygon(hdc, ah2, 3); } while (0)
+        POINT arc[16];
         SelectObject(hdc, pen2);
-        for (k = 0; k < 18; k++) {
-            double deg = 60 - 300.0 * k / 17;
-            double rad = deg * 3.14159265358979 / 180.0;
-            pts[k].x = (int)(cxx + r * cos(rad) + 0.5);
-            pts[k].y = (int)(cyy - r * sin(rad) + 0.5);
-        }
-        Polyline(hdc, pts, 18);
-        {
-            /* 箭头画在弧的起点（上端），沿切线方向 */
-            double rad = 60.0 * 3.14159265358979 / 180.0;
-            int tx = (int)(cxx + r * cos(rad) + 0.5);
-            int ty = (int)(cyy - r * sin(rad) + 0.5);
-            POINT ah[3];
-            ah[0].x = tx; ah[0].y = ty;
-            ah[1].x = tx - (int)(sin(rad) * 5 + cos(rad) * 3 + 0.5);
-            ah[1].y = ty + (int)(cos(rad) * 5 - sin(rad) * 3 + 0.5);
-            ah[2].x = tx - (int)(sin(rad) * 5 - cos(rad) * 3 + 0.5);
-            ah[2].y = ty + (int)(cos(rad) * 5 + sin(rad) * 3 + 0.5);
-            SelectObject(hdc, pen1);
-            Polygon(hdc, ah, 3);
-        }
+        LP_ARC(arc, 60, 210, 16);     /* 上段弧：从右上绕左侧到左下 */
+        Polyline(hdc, arc, 16);
+        LP_ARC(arc, 240, 390, 16);    /* 下段弧：从左下绕右侧回右上 */
+        Polyline(hdc, arc, 16);
+        SelectObject(hdc, pen1);
+        LP_ARROW(60);                 /* 上端箭头朝右 */
+        LP_ARROW(240);                /* 下端箭头朝左 */
+        #undef LP_ARC
+        #undef LP_ARROW
         break;
     }
     case ICO_ORDER: {
@@ -2242,11 +2580,16 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
         break;
     }
     case ICO_PLAYONCE: {
-        /* 一次性播放：播放三角 + 右侧竖线（播放到此为止） */
-        POINT t[3] = { {x0+2,y0+2},{x0+2,y0+s-2},{x0+s-7,cy} };
+        /* 一次性播放：播放三角 + 右侧数字 1（区别于“下一曲”的竖杠） */
+        POINT t[3] = { {x0+1,y0+2},{x0+1,y0+s-2},{x0+9,cy} };
         Polygon(hdc, t, 3);
-        SelectObject(hdc, pen3);
-        MoveToEx(hdc, x0+s-4, y0+3, NULL); LineTo(hdc, x0+s-4, y0+s-3);
+        SelectObject(hdc, pen2);
+        /* 小旗 */
+        MoveToEx(hdc, x0+10, y0+5, NULL); LineTo(hdc, x0+13, y0+3);
+        /* 竖杆 */
+        MoveToEx(hdc, x0+13, y0+3, NULL); LineTo(hdc, x0+13, y0+s-3);
+        /* 底座 */
+        MoveToEx(hdc, x0+10, y0+s-3, NULL); LineTo(hdc, x0+15, y0+s-3);
         break;
     }
     case ICO_FOLDER: {
@@ -2323,13 +2666,14 @@ static int CountMp3InDir(const wchar_t *dir)
     return n;
 }
 
-/* 把旧目录里所有 .mp3 移动到新目录 */
-static void MoveMp3Files(const wchar_t *oldDir, const wchar_t *newDir)
+/* 把旧目录里所有缓存文件（.mp3 及同名 .nfo 元数据）移动到新目录 */
+static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir,
+                           const wchar_t *ext)
 {
     wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
-    swprintf(pat, MAX_PATH, L"%s*.mp3", oldDir);
+    swprintf(pat, MAX_PATH, L"%s*.%s", oldDir, ext);
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
@@ -2360,11 +2704,14 @@ static void OnDirButton(void)
     DestroyMenu(menu);
     if (cmd == 0) return;
 
-    CacheDir(curDir, MAX_PATH);
-    curDir[wcslen(curDir) - 1] = 0;   /* 去末尾反斜杠便于浏览 */
+    CacheDir(curDir, MAX_PATH);   /* 保留末尾反斜杠：CountMp3InDir/移动都需要它 */
 
     if (cmd == 1) {
-        ShellExecuteW(g_hwnd, L"open", curDir, NULL, NULL, SW_SHOWNORMAL);
+        wchar_t openDir[MAX_PATH];
+        wcsncpy(openDir, curDir, MAX_PATH);
+        openDir[MAX_PATH - 1] = 0;
+        openDir[wcslen(openDir) - 1] = 0;   /* 浏览时去掉末尾反斜杠 */
+        ShellExecuteW(g_hwnd, L"open", openDir, NULL, NULL, SW_SHOWNORMAL);
     } else if (cmd == 2) {
         BROWSEINFOW bi;
         LPITEMIDLIST pidl;
@@ -2375,18 +2722,18 @@ static void OnDirButton(void)
         bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
         pidl = SHBrowseForFolderW(&bi);
         if (pidl && SHGetPathFromIDListW(pidl, newPath)) {
-            int oldHasFiles = CountMp3InDir(curDir);
+            int oldHasFiles = CountMp3InDir(curDir);   /* curDir 带反斜杠 */
             wchar_t newDir[MAX_PATH];
             swprintf(newDir, MAX_PATH, L"%s\\", newPath);
-            /* 若旧目录有缓存，询问是否移动 */
-            if (oldHasFiles > 0) {
+            /* 新旧相同就不必移动 */
+            if (oldHasFiles > 0 &&
+                _wcsicmp(curDir, newDir) != 0) {
                 wchar_t msg[256];
                 swprintf(msg, 256, L"当前缓存目录有 %d 个音频文件，是否移动到新目录？", oldHasFiles);
                 if (MessageBoxW(g_hwnd, msg, L"移动缓存", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    wchar_t oldDir[MAX_PATH];
-                    CacheDir(oldDir, MAX_PATH);
-                    EnsureCacheDir();
-                    MoveMp3Files(oldDir, newDir);
+                    CreateDirectoryW(newPath, NULL);
+                    MoveCacheFiles(curDir, newDir, L"mp3");
+                    MoveCacheFiles(curDir, newDir, L"nfo");
                 }
             }
             wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
@@ -2400,18 +2747,33 @@ static void OnDirButton(void)
         EnsureCacheDir();
         SetStatus(L"缓存目录已恢复默认");
     }
+
+    /* 目录变了：刷新“已缓存”虚拟行；正在看离线列表则重建内容并保持选中 */
+    if (cmd == 2 || cmd == 3) {
+        RefreshCachedEntry();
+        if (g_viewCached) {
+            int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
+            FreeCachePodcast();
+            LoadCachePodcast();
+            FillEpisodeList();
+            if (sel < 0) sel = g_podCount;
+            SendMessageW(g_listPod, LB_SETCURSEL, sel, 0);
+        }
+    }
 }
 
 /* ================= 工具提示 ================= */
-/* 给按钮加一条固定文本的系统 tooltip（不使用 TTF_SUBCLASS，
- * 改由 PanelProc 转发鼠标消息，避免与自管子类化冲突） */
+/* 给按钮加一条固定文本的系统 tooltip。
+ * TTF_SUBCLASS 让 tooltip 自己子类化控件窗口拦截鼠标消息；
+ * 本程序的 PanelProc 是更早安装的外层子类，二者通过
+ * SetWindowSubclass/CallWindowProc 链式共存，互不影响。 */
 static void AddButtonTip(HWND btn, const wchar_t *text)
 {
     TOOLINFOW ti;
     if (!g_hwndTip || !btn) return;
     ZeroMemory(&ti, sizeof(ti));
     ti.cbSize = sizeof(ti);
-    ti.uFlags = TTF_IDISHWND;
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
     ti.hwnd = GetParent(btn);
     ti.uId = (UINT_PTR)btn;
     ti.lpszText = (LPWSTR)text;
@@ -2658,7 +3020,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             {
                 TOOLINFOW ti; ZeroMemory(&ti, sizeof(ti));
                 ti.cbSize = sizeof(ti);
-                ti.uFlags = TTF_IDISHWND;
+                ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
                 ti.hwnd = hwnd;
                 ti.uId = (UINT_PTR)g_listEp;
                 ti.lpszText = LPSTR_TEXTCALLBACKW;
@@ -2697,8 +3059,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         }
         if (di->CtlID != IDC_LIST_POD || di->itemID == (UINT)-1) break;
+        if ((int)di->itemID > g_podCount) break;
         {
-            Podcast *p = &g_pods[di->itemID];
+            int isCache = ((int)di->itemID == g_podCount);
+            Podcast *p = isCache ? &g_cachePod : &g_pods[di->itemID];
             int isSel = (di->itemState & ODS_SELECTED) != 0;
             int isPlaying = (g_playPod == (int)di->itemID && g_playState == 1);
             HBRUSH bg = CreateSolidBrush(isSel ? RGB(204,232,255) : RGB(255,255,255));
@@ -2709,8 +3073,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DeleteObject(bg);
 
             /* 封面区：48x48，左留 2px、上留 3px。
-             * 删除模式 → 大红叉按钮；排序模式 → 左右两个上/下箭头按钮 */
-            if (g_podMode == 1) {
+             * 删除模式 → 大红叉按钮；排序模式 → 左右两个上/下箭头按钮
+             * “已缓存”虚拟行不参与删除/排序，画一个下载缓存图标 */
+            if (isCache) {
+                RECT ib = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
+                HBRUSH fb = CreateSolidBrush(RGB(238,242,248));
+                HPEN gp = CreatePen(PS_SOLID, 2, RGB(120,140,170));
+                HBRUSH ab = CreateSolidBrush(RGB(120,140,170));
+                HGDIOBJ oldPen, oldBrush;
+                FillRect(di->hDC, &ib, fb);
+                DeleteObject(fb);
+                oldPen = SelectObject(di->hDC, gp);
+                oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+                RoundRect(di->hDC, ib.left+3, ib.top+3, ib.right-3, ib.bottom-3, 8, 8);
+                /* 向下箭头（表示缓存到本地） */
+                SelectObject(di->hDC, ab);
+                {
+                    POINT tri[3] = {
+                        {rc.left+17, rc.top+22}, {rc.left+33, rc.top+22},
+                        {rc.left+25, rc.top+33} };
+                    Polygon(di->hDC, tri, 3);
+                }
+                SelectObject(di->hDC, GetStockObject(NULL_PEN));
+                {
+                    RECT tb = { rc.left+22, rc.top+12, rc.left+29, rc.top+24 };
+                    Rectangle(di->hDC, tb.left, tb.top, tb.right, tb.bottom);
+                }
+                SelectObject(di->hDC, oldPen);
+                SelectObject(di->hDC, oldBrush);
+                DeleteObject(ab);
+                DeleteObject(gp);
+                textLeft = rc.left + 56;
+            } else if (g_podMode == 1) {
                 RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
                 HPEN rp = CreatePen(PS_SOLID, 5, RGB(205, 40, 40));
                 HGDIOBJ oldp = SelectObject(di->hDC, rp);
@@ -2764,20 +3158,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             /* 标题：加粗，播放中绿色 */
             {
+                wchar_t title[64];
+                const wchar_t *tp;
                 RECT rct = rc;
                 rct.left = textLeft;
                 rct.right = rc.right - 28;
                 rct.top += 3;
                 rct.bottom = rct.top + 22;
+                if (isCache) {
+                    swprintf(title, 64, L"已缓存 (%d)", g_cacheFileCount);
+                    tp = title;
+                } else tp = p->title;
                 SetTextColor(di->hDC, isPlaying ? RGB(0,140,60) : RGB(20,20,20));
                 SelectObject(di->hDC, g_fontBold);
-                DrawTextW(di->hDC, p->title, -1, &rct,
+                DrawTextW(di->hDC, tp, -1, &rct,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
 
-            /* 副标题：copyright（空则 author），小字号灰色，标题下方 */
+            /* 副标题：copyright（空则 author），小字号灰色，标题下方；
+             * 虚拟行固定提示离线播放 */
             {
-                const wchar_t *sub = p->copyright ? p->copyright : p->author;
+                const wchar_t *sub = isCache
+                    ? L"离线播放本地音频"
+                    : (p->copyright ? p->copyright : p->author);
                 if (sub && *sub) {
                     RECT rcs = rc;
                     rcs.left = textLeft;
@@ -2791,11 +3194,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
 
-            /* 右侧：剧集数（小一号字体） */
+            /* 右侧：剧集数（小一号字体）；虚拟行显示缓存文件数 */
             {
                 wchar_t cnt[16];
                 RECT rc2 = di->rcItem;
-                swprintf(cnt, 16, L"%d", p->epCount);
+                int n = isCache ? g_cacheFileCount : p->epCount;
+                swprintf(cnt, 16, L"%d", n);
                 SetTextColor(di->hDC, isSel ? RGB(40,40,40) : RGB(120,120,120));
                 SelectObject(di->hDC, g_fontSmall);
                 rc2.left = rc2.right - 26;
@@ -3048,12 +3452,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return CDRF_NOTIFYITEMDRAW;   /* 必须，否则收不到 ITEMPREPAINT */
                 } else if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
                     int i = (int)cd->nmcd.dwItemSpec;
+                    Podcast *p = ActivePodcast();
                     int playing = (g_playPod == g_curPod && g_curEp == i && g_playState == 1);
+                    int cached = 0;
+                    if (p && i >= 0 && i < p->epCount)
+                        cached = p->eps[i].localFile || EpisodeIsCached(&p->eps[i]);
                     if (playing) {
-                        cd->clrText = RGB(0, 150, 70);
-                    } else if (g_curPod >= 0 && g_curPod < g_podCount &&
-                               i >= 0 && i < g_pods[g_curPod].epCount &&
-                               EpisodeIsCached(&g_pods[g_curPod].eps[i])) {
+                        /* 播放行同时是选中行（默认蓝底白字会盖住绿字），
+                         * 自己铺一层浅绿底再用深绿字 */
+                        RECT rr = cd->nmcd.rc;
+                        HBRUSH bg = CreateSolidBrush(RGB(222, 244, 228));
+                        FillRect(cd->nmcd.hdc, &rr, bg);
+                        DeleteObject(bg);
+                        cd->clrText = RGB(0, 130, 60);
+                    } else if (cached) {
                         cd->clrText = RGB(190, 155, 0);
                     }
                     return CDRF_NEWFONT;
@@ -3141,12 +3553,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_podCount < MAX_PODCASTS) {
                 int newIdx = g_podCount;
                 g_pods[g_podCount] = *pod;
-                SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)pod->title);
+                /* 插入到“已缓存”虚拟行之前（无虚拟行时等同末尾追加） */
+                SendMessageW(g_listPod, LB_INSERTSTRING, newIdx, (LPARAM)pod->title);
                 g_podCount++;
-                /* 单条添加：自动选中新条目，让用户立即看到剧集 */
                 if (incremental) {
-                    SendMessageW(g_listPod, LB_SETCURSEL, newIdx, 0);
-                    SelectPodcast(newIdx);
+                    if (g_viewCached) {
+                        /* 正在看离线列表：保持虚拟行选中，只让新播客排在前面 */
+                        SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
+                    } else {
+                        /* 单条添加：自动选中新条目，让用户立即看到剧集 */
+                        SendMessageW(g_listPod, LB_SETCURSEL, newIdx, 0);
+                        SelectPodcast(newIdx);
+                    }
+                } else if (g_viewCached) {
+                    /* 启动时预置了“已缓存”选中：插入真实播客后选中跟随虚拟行 */
+                    SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
                 }
             } else {
                 FreePodcast(pod);   /* 超过上限：丢弃并释放 */
@@ -3158,16 +3579,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_APP_FEEDS_DONE:
         g_feedsLoading = 0;
+        RefreshCachedEntry();   /* 末尾补“已缓存”行（有本地音频时） */
         if (g_podCount > 0) {
+            int cursel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
             SetStatus(L"就绪");
-            /* 单条添加时新条目已在 FEED_ADDED 中选中；全量刷新则默认第一条 */
-            if (SendMessageW(g_listPod, LB_GETCURSEL, 0, 0) == LB_ERR) {
+            /* 单条添加时新条目已在 FEED_ADDED 中选中；全量刷新默认第一条。
+             * 启动时为离线预置了“已缓存”选中，订阅加载成功后切到第一条 */
+            if (cursel == LB_ERR || (g_fullReload && g_viewCached)) {
                 SendMessageW(g_listPod, LB_SETCURSEL, 0, 0);
                 SelectPodcast(0);
             }
+        } else if (g_cacheRowHere) {
+            SetStatus(L"没有订阅也能听：正在播放列表最后的「已缓存」，无需联网");
+            /* 直接选中“已缓存”行，离线音频一目了然 */
+            SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
+            SelectPodcast(g_podCount);
         } else {
             SetStatus(L"还没有订阅，点左下角「+」按钮添加 RSS 播客");
         }
+        g_fullReload = 0;
         return 0;
 
     case WM_APP_EP_READY: {
@@ -3196,6 +3626,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ProbeAudio(cache, info, 128, &pd);
                 g_dur100ns = pd;
                 SetWindowTextW(g_stFormat, info);
+                /* 探测到时长：补进剧集并写同名 nfo（供离线“已缓存”列表使用） */
+                if (pd > 0) {
+                    if (e->durationSec <= 0) {
+                        e->durationSec = (int)(pd / 10000000);
+                        {
+                            wchar_t dur[16];
+                            LVITEMW li;
+                            FmtTime(e->durationSec, dur, 16);
+                            ZeroMemory(&li, sizeof(li));
+                            li.iItem = epIdx;
+                            li.iSubItem = 2;
+                            li.pszText = dur;
+                            SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&li);
+                        }
+                    }
+                    WriteEpisodeMeta(g_pods[r->pod].title, e, (int)(pd / 10000000));
+                } else {
+                    WriteEpisodeMeta(g_pods[r->pod].title, e, e->durationSec);
+                }
                 swprintf(st, 512, L"正在播放：%s", e->title);
                 SetStatus(st);
                 PlayerPlayFile(cache);
@@ -3205,6 +3654,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             free(r->url);
             free(r);
         }
+        RefreshCachedEntry();   /* 首次下载完成时让“已缓存”行出现/更新计数 */
         InvalidateRect(g_listEp, NULL, TRUE);   /* 下载完成 → 缓存标记变黄 */
         return 0;
     }
@@ -3228,6 +3678,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (d > 0) g_dur100ns = d;
                 InvalidateRect(g_listPod, NULL, TRUE);   /* 标题变绿 */
                 InvalidateRect(g_listEp, NULL, TRUE);    /* 剧集变绿 */
+            } else {
+                /* 如无可用音频输出设备（0xC00D11BA）：明确提示，避免状态一直停在“正在播放” */
+                g_playState = 0;
+                SetStatus(L"无法开始播放：未找到可用的音频输出设备");
+                InvalidateRect(g_btnPlay, NULL, TRUE);
             }
             break;
         case MFP_EVENT_TYPE_PAUSE:
@@ -3247,10 +3702,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 /* 一次性播放：播放完毕即停止 */
                 PlayerStop();
                 SetStatus(L"播放完毕");
-            } else if (g_curPod >= 0 && g_curEp >= 0 &&
-                       g_pods[g_curPod].epCount > 1) {
-                /* 顺序/随机：自动下一曲 */
-                PlayAdjacent(+1);
+            } else if (g_curPod >= 0 && g_curEp >= 0) {
+                int epN = (g_curPod == g_podCount)
+                    ? g_cachePod.epCount : g_pods[g_curPod].epCount;
+                if (epN > 1) PlayAdjacent(+1);   /* 顺序/随机：自动下一曲 */
+                else { PlayerStop(); SetStatus(L"播放完毕"); }
             } else {
                 PlayerStop();
                 SetStatus(L"播放完毕");
@@ -3272,6 +3728,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SaveConfig();   /* 退出时统一写盘：排序/列宽/音量/字号/窗口尺寸/订阅顺序 */
         if (g_player) { g_player->lpVtbl->Release(g_player); g_player = NULL; }
         FreePodcasts();
+        FreeCachePodcast();
         free(g_playUrl);
         if (g_whiteBrush) DeleteObject(g_whiteBrush);
         if (g_font) DeleteObject(g_font);
@@ -3343,6 +3800,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
     ReloadFeeds();
+    /* 离线启动时订阅可能加载很慢/失败：先立即挂上“已缓存”行，不等订阅 */
+    RefreshCachedEntry();
+    if (g_podCount == 0 && g_cacheRowHere) {
+        SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
+        SelectPodcast(g_podCount);
+    }
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         /* ESC 退出（叉叉也是同一条退出路径，都会触发 WM_DESTROY 保存） */
@@ -3350,6 +3813,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
             DestroyWindow(hwnd);
             continue;
         }
+        /* tooltip 采用 TTF_SUBCLASS 自行拦截鼠标消息，无需在此转发 */
         if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
