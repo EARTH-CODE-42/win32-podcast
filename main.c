@@ -217,7 +217,7 @@ static long long g_shutdownAt = 0;
 /* 任务栏缩略图工具栏（上一曲/播放暂停/下一曲/随机下一曲） */
 static ITaskbarList3 *g_taskbar = NULL;
 static UINT   g_wmTaskbarBtnCreated = 0;
-static HICON  g_tbIco[6] = { NULL };   /* 0=prev 1=play 2=pause 3=next 4=shuffle */
+static HICON  g_tbIco[5] = { NULL };   /* 0=prev 1=play 2=pause 3=next 4=shuffle */
 
 static ULONG_PTR g_gdipToken = 0;
 
@@ -1059,7 +1059,7 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
         }
         WinHttpCloseHandle(own);
     }
-    if (!buf) { buf = (char*)malloc(1); buf[0] = 0; }
+    if (!buf) { buf = (char*)malloc(1); if (!buf) return NULL; buf[0] = 0; }
     else buf[total] = 0;
     *outLen = total;
     return buf;
@@ -1287,12 +1287,13 @@ static long long ParseDate(const char *s, wchar_t *outText, int outN)
     if (outText && outN > 0) outText[0] = 0;
     if (!s) return 0;
 
-    /* ISO8601: 2015-02-03T12:34:56... / 2015-02-03 12:34 */
-    if (s[0] && isdigit((unsigned char)s[0]) && s[4] == '-' && s[7] == '-') {
+    /* ISO8601: 2015-02-03T12:34:56... / 2015-02-03 12:34
+     * 先查长度再按下标取字符，避免短字符串越界读 */
+    if (strlen(s) >= 10 && isdigit((unsigned char)s[0]) && s[4] == '-' && s[7] == '-') {
         year = atoi(s);
         mon  = atoi(s + 5);
         day  = atoi(s + 8);
-        if (s[10] == 'T' || s[10] == ' ') {
+        if (strlen(s) >= 16 && (s[10] == 'T' || s[10] == ' ')) {
             hour = atoi(s + 11);
             if (s[13] == ':') min = atoi(s + 14);
         }
@@ -1417,9 +1418,13 @@ static int ParseFeed(const char *xml, Podcast *pod)
         if (encUrl && pod->epCount < 10000) {
             char *d;
             if (pod->epCount >= pod->epCap) {
+                /* realloc 必须用临时变量接收：失败会丢原指针，
+                 * 且 eps 变 NULL 后 FreePodcast 按 epCount 访问会崩 */
+                Episode *ne;
                 pod->epCap = pod->epCap ? pod->epCap * 2 : 32;
-                pod->eps = (Episode*)realloc(pod->eps, pod->epCap * sizeof(Episode));
-                if (!pod->eps) { free(encUrl); free(seg); return 0; }
+                ne = (Episode*)realloc(pod->eps, pod->epCap * sizeof(Episode));
+                if (!ne) { free(encUrl); free(seg); return 0; }
+                pod->eps = ne;
             }
             e = &pod->eps[pod->epCount];
             memset(e, 0, sizeof(*e));
@@ -1433,7 +1438,13 @@ static int ParseFeed(const char *xml, Podcast *pod)
             e->author = GetXmlTextW(seg, "itunes:author", 0);
             CleanXmlText(encUrl); /* 先解码 XML 转义（如 &amp; -> &），再转宽字符 */
             e->url = U8ToW(encUrl);
-            if (!e->url) { free(encUrl); free(seg); item = FindOpenTag(itemEnd, "item"); continue; }
+            if (!e->url) {
+                /* 槽位复用前释放已 dup 的字段，防止泄漏 */
+                free(e->title); free(e->desc); free(e->author);
+                free(encUrl); free(seg);
+                item = FindOpenTag(itemEnd, "item");
+                continue;
+            }
             d = XmlText(seg, "itunes:duration");
             if (!d) d = XmlText(seg, "duration");
             if (d) { e->durationSec = ParseDuration(d); free(d); }
@@ -1790,8 +1801,13 @@ static int EpCmp(const void *pa, const void *pb)
     const Episode *a = (const Episode*)pa, *b = (const Episode*)pb;
     int r = 0;
     switch (g_sortCol) {
-    case SORT_TITLE: r = lstrcmpiW(a->title, b->title); break;
-    case SORT_DATE:  r = a->dateKey - b->dateKey; break;
+    case SORT_TITLE:
+        r = lstrcmpiW(a->title ? a->title : L"", b->title ? b->title : L"");
+        break;
+    case SORT_DATE:
+        /* dateKey 是 long long，直接相减截断成 int 会溢出翻转 */
+        r = (a->dateKey > b->dateKey) - (a->dateKey < b->dateKey);
+        break;
     default:         r = a->durationSec - b->durationSec; break;
     }
     if (r == 0) r = a->origIdx - b->origIdx;
@@ -1865,18 +1881,34 @@ static Podcast* LoadOneFeed(const char *url)
     return NULL;
 }
 
+/* 加载线程参数：订阅 URL 快照。线程不再读 g_feedUrls，
+ * 避免 UI 线程增删订阅（realloc/free）与加载线程竞争 */
+typedef struct { char **urls; int count; } FeedLoadArg;
+
+static void FreeFeedLoadArg(FeedLoadArg *a)
+{
+    int i;
+    if (!a) return;
+    if (a->urls) {
+        for (i = 0; i < a->count; i++) free(a->urls[i]);
+        free(a->urls);
+    }
+    free(a);
+}
+
 static DWORD WINAPI FeedLoaderThread(LPVOID param)
 {
+    FeedLoadArg *a = (FeedLoadArg*)param;
     int i, loaded = 0;
-    (void)param;
 
-    for (i = 0; i < g_feedUrlCount; i++) {
-        Podcast *pod = LoadOneFeed(g_feedUrls[i]);
+    for (i = 0; i < a->count; i++) {
+        Podcast *pod = LoadOneFeed(a->urls[i]);
         if (pod) {
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
             loaded++;
         }
     }
+    FreeFeedLoadArg(a);
     PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, 0);
     return 0;
 }
@@ -1909,7 +1941,16 @@ static void AddSingleFeed(const char *url)
     SetStatus(tr(TR_LOADING_FEEDS));
     g_feedsLoading = 1;
     g_fullReload = 0;
-    CreateThread(NULL, 0, SingleFeedLoaderThread, a, 0, NULL);
+    {
+        HANDLE th = CreateThread(NULL, 0, SingleFeedLoaderThread, a, 0, NULL);
+        if (!th) {
+            g_feedsLoading = 0;
+            free(a->url); free(a);
+            SetStatus(tr(TR_READY));
+            return;
+        }
+        CloseHandle(th);   /* 线程句柄无需保留：不等待不查询 */
+    }
 }
 
 /* ================= 后台线程：下载音频 ================= */
@@ -1952,7 +1993,13 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     FILE *f;
 
     r = (EpReady*)calloc(1, sizeof(EpReady));
-    if (!r) { free(job->url); free(job); return 0; }
+    if (!r) {
+        /* 失败也要复位下载状态，否则 UI 永久停在“准备音频” */
+        InterlockedIncrement(&g_dlGen);
+        g_downloading = 0;
+        free(job->url); free(job);
+        return 0;
+    }
     r->pod = job->pod;
     r->url = job->url;   /* 转移所有权给 r */
     r->gen = job->gen;
@@ -2498,11 +2545,16 @@ static void RequestPlayEpisode(int pod, int ep)
     job->gen = myGen;
     g_curDlJob = job;
     g_downloading = 1;
-    if (!CreateThread(NULL, 0, EpisodeDlThread, job, 0, NULL)) {
-        g_curDlJob = NULL;
-        g_downloading = 0;
-        free(job->url); free(job);
-        SetStatus(tr(TR_DL_THREAD_FAIL));
+    {
+        HANDLE th = CreateThread(NULL, 0, EpisodeDlThread, job, 0, NULL);
+        if (!th) {
+            g_curDlJob = NULL;
+            g_downloading = 0;
+            free(job->url); free(job);
+            SetStatus(tr(TR_DL_THREAD_FAIL));
+        } else {
+            CloseHandle(th);   /* 线程句柄无需保留：不等待不查询 */
+        }
     }
 }
 
@@ -2600,10 +2652,33 @@ static void ReloadFeeds(void)
     g_podMode = 0;
     SetStatus(tr(TR_LOADING_FEEDS));
     /* 刷新只用内存里的订阅链接；feeds.ini 仅启动读一次、退出写一次，
-     * 因此运行中的删除/排序不会被刷新覆盖 */
+     * 因此运行中的删除/排序不会被刷新覆盖。
+     * 给加载线程一份 URL 快照：加载期间增删订阅不会踩内存 */
     g_feedsLoading = 1;
     g_fullReload = 1;
-    CreateThread(NULL, 0, FeedLoaderThread, NULL, 0, NULL);
+    {
+        FeedLoadArg *a = (FeedLoadArg*)calloc(1, sizeof(FeedLoadArg));
+        HANDLE th = NULL;
+        int i, ok = (a != NULL);
+        if (ok && g_feedUrlCount > 0) {
+            a->urls = (char**)calloc(g_feedUrlCount, sizeof(char*));
+            a->count = g_feedUrlCount;
+            if (!a->urls) ok = 0;
+            for (i = 0; ok && i < a->count; i++) {
+                a->urls[i] = _strdup(g_feedUrls[i]);
+                if (!a->urls[i]) ok = 0;
+            }
+        }
+        if (ok)
+            th = CreateThread(NULL, 0, FeedLoaderThread, a, 0, NULL);
+        if (!th) {          /* 参数构造或线程创建失败：复位状态，不卡死刷新 */
+            FreeFeedLoadArg(a);
+            g_feedsLoading = 0;
+            SetStatus(tr(TR_READY));
+            return;
+        }
+        CloseHandle(th);    /* 线程句柄无需保留：不等待不查询 */
+    }
 }
 
 /* ================= 播客订阅管理（增删/排序） ================= */
@@ -2916,6 +2991,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PaintDarkScrollBars(hwnd);
         return lr;
     }
+    /* 夜间模式：吞掉滚动条悬停消息。系统进入“热态”的唯一入口就是
+     * WM_NCMOUSEMOVE 的默认处理；不给它，滑块永远不会被画成亮色，
+     * 也无需事后补盖（补盖总有盖不住的时机）。
+     * 滚动条功能不受影响：点击/拖动走 WM_NCLBUTTONDOWN 的内部模态循环 */
+    if (g_darkMode && msg == WM_NCMOUSEMOVE &&
+        (hwnd == g_listPod || hwnd == g_listEp || hwnd == g_editDesc))
+        return 0;
     /* 拖动滚动条后系统未必重发 WM_NCPAINT，主动补绘；
      * 激活切换(WM_NCACTIVATE)和缩放(WM_SIZE)也会把滚动条重画回亮色 */
     if (g_darkMode && (msg == WM_VSCROLL || msg == WM_HSCROLL ||
@@ -3749,12 +3831,19 @@ static HICON CreateTbIcon(int kind)
     return ico;
 }
 
-/* 响应 WM_TASKBARBUTTONCREATED：创建并挂接缩略图按钮 */
+/* 响应 WM_TASKBARBUTTONCREATED：创建并挂接缩略图按钮。
+ * Explorer 重启会重播此消息，先释放旧图标/COM 对象防泄漏 */
 static void InitThumbbar(void)
 {
     THUMBBUTTON tb[4];
     HRESULT hr;
+    int i;
     if (!g_wmTaskbarBtnCreated) return;
+
+    if (g_taskbar) { g_taskbar->lpVtbl->Release(g_taskbar); g_taskbar = NULL; }
+    for (i = 0; i < 5; i++)
+        if (g_tbIco[i]) { DestroyIcon(g_tbIco[i]); g_tbIco[i] = NULL; }
+
     hr = CoCreateInstance(&CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
                           &IID_ITaskbarList3, (void**)&g_taskbar);
     if (FAILED(hr) || !g_taskbar) return;
@@ -3794,24 +3883,14 @@ static void InitThumbbar(void)
 /* 播放/暂停状态切换时更新缩略图按钮图标 */
 static void UpdateThumbbarPlayPause(void)
 {
+    THUMBBUTTON tb;
     if (!g_taskbar) return;
-    if (g_playState == 1) {
-        THUMBBUTTON tb;
-        ZeroMemory(&tb, sizeof(tb));
-        tb.dwMask = THB_ICON | THB_TOOLTIP;
-        tb.iId = 1;
-        tb.hIcon = g_tbIco[2];   /* 暂停图标 */
-        wcscpy_s(tb.szTip, 260, tr(TR_TB_PAUSE));
-        g_taskbar->lpVtbl->ThumbBarUpdateButtons(g_taskbar, g_hwnd, 1, &tb);
-    } else {
-        THUMBBUTTON tb;
-        ZeroMemory(&tb, sizeof(tb));
-        tb.dwMask = THB_ICON | THB_TOOLTIP;
-        tb.iId = 1;
-        tb.hIcon = g_tbIco[1];   /* 播放图标 */
-        wcscpy_s(tb.szTip, 260, tr(TR_TB_PLAY));
-        g_taskbar->lpVtbl->ThumbBarUpdateButtons(g_taskbar, g_hwnd, 1, &tb);
-    }
+    ZeroMemory(&tb, sizeof(tb));
+    tb.dwMask = THB_ICON | THB_TOOLTIP;
+    tb.iId = 1;
+    tb.hIcon = g_tbIco[g_playState == 1 ? 2 : 1];   /* 播放中显示暂停图标 */
+    wcscpy_s(tb.szTip, 260, g_playState == 1 ? tr(TR_TB_PAUSE) : tr(TR_TB_PLAY));
+    g_taskbar->lpVtbl->ThumbBarUpdateButtons(g_taskbar, g_hwnd, 1, &tb);
 }
 
 /* ================= 工具提示 ================= */
@@ -4102,10 +4181,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lParam;
-        if (di->CtlType == ODT_HEADER) {
-            /* 正常路径在 ListView 的子类 PanelProc 中；此处兜底 */
-            return DrawHeaderItem(di) ? TRUE : FALSE;
-        }
         if (di->CtlType == ODT_BUTTON) {
             int on, kind = IconKindOf(di->CtlID, &on);
             if (kind >= 0) { DrawIconButton(di, kind, on); return TRUE; }
@@ -4455,8 +4530,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (tid == 2) PlayAdjacent(+1);               /* 下一曲 */
             else if (tid == 3) {                               /* 随机下一曲 */
                 int pod = (g_playPod >= 0) ? g_playPod : g_curPod;
-                int n = (pod == g_podCount) ? g_cachePod.epCount : g_pods[pod].epCount;
-                if (pod >= 0 && n > 0) {
+                int n;
+                if (pod < 0) return 0;
+                n = (pod == g_podCount) ? g_cachePod.epCount : g_pods[pod].epCount;
+                if (n > 0) {
                     int target = rand() % n;
                     RequestPlayEpisode(pod, target);
                 }
@@ -4644,11 +4721,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_dur100ns > 0) {
                     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE,
                         (LPARAM)(pos * 1000 / g_dur100ns));
-                    if (pos >= g_dur100ns - 5000000 && pos > 0) {
-                        /* 播放结束 */
-                        PlayerStop();
-                        SetStatus(tr(TR_FINISHED));
-                    }
                 }
             }
         }
@@ -4902,7 +4974,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     }
 
     icc.dwSize = sizeof(icc);
-    icc.dwICC  = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES;
+    icc.dwICC  = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
     srand((unsigned)GetTickCount());
 
