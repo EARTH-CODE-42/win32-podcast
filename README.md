@@ -1,28 +1,39 @@
-# LightPodcast
+# LiteTune
 
-一个极简、绿色便携的 RSS 播客播放器。纯 C 语言 + 原生 Win32 API，单文件可执行，无需安装、不依赖额外 DLL。
+一个极简、绿色便携的 RSS 播客播放器。纯 C 语言 + 原生 Win32 API，单个可执行文件（约 115 KB），无需安装、不依赖任何第三方 DLL。
 
 ## 功能
 
-- RSS 播客订阅管理（添加 / 删除 / 调整顺序 / 刷新）
-- 剧集列表（标题、日期、时长，列头可排序）
-- 在线播放与本地缓存（音频自动下载到 `cache` 目录）
+- RSS 播客订阅管理（添加 / 删除 / 调整顺序 / 刷新），单实例运行
+- 剧集列表（标题、日期、时长，列头点击排序）
+- 在线播放与本地缓存：音频自动下载到 `cache` 目录，断网也能离线收听
 - 播放控制：上一曲 / 播放暂停 / 下一曲 / 停止 / 静音 / 音量
 - 播放模式：顺序播放 / 随机播放 / 单曲循环 / 一次性播放
 - 进度条拖动定位、播放中剧集高亮（绿色）、已缓存剧集标黄
+- 亮色 / 暗色主题（运行时即时切换）
+- 中英文双语界面（设置菜单切换，自动记忆，默认中文）
+- 定时关机（15–120 分钟，标题栏显示倒计时）
 - 三档字号调节（Ctrl + 鼠标滚轮）
 - 可自定义缓存目录（支持打开 / 更改 / 移动已有缓存）
+- 任务栏缩略图按钮：上一曲 / 播放暂停 / 下一曲 / 随机下一曲
 - 鼠标悬停提示：按钮说明、剧集完整文本、播客封面 + 标题 + 作者
+
+## 快捷键
+
+| 按键 | 功能 |
+|------|------|
+| `空格` | 播放 / 暂停 |
+| `ESC` | 退出程序（添加订阅弹窗打开时仅关闭弹窗） |
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| `lightpodcast.exe` | 主程序 |
+| `LiteTune.exe` | 主程序（绿色单文件） |
 | `main.c` | 全部源代码 |
 | `feeds.ini` | 配置与订阅源（首次运行自动生成） |
 | `cache\` | 已下载音频缓存（文件名 = URL 哈希） |
-| `resource.rc` / `resource.o` / `app.manifest` | 编译资源（图标、DPI 感知） |
+| `resource.rc` / `app.manifest` | 编译资源（DPI 感知清单） |
 
 ## 配置（feeds.ini）
 
@@ -36,6 +47,8 @@ cw1=88
 cw2=44
 vol=80                ; 音量 0-100
 font=0                ; 字号级别 0/1/2
+dark=0                ; 暗色模式 0/1
+lang=zh               ; 界面语言 zh/en
 winw=480              ; 窗口尺寸（客户区）
 winh=360
 cachedir=             ; 缓存目录（留空 = 程序目录下 cache）
@@ -49,16 +62,26 @@ https://example.com/feed2.xml
 
 ## 编译
 
-需要 MinGW-w64（gcc）：
+需要 MinGW-w64（gcc 14 验证通过）：
 
 ```bash
 windres resource.rc -O coff -o resource.o
-gcc -O2 -s -mwindows -municode -o lightpodcast.exe main.c resource.o \
-    -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lmfuuid \
-    -lole32 -luuid -lgdiplus -lm -lshell32
+gcc -O2 -s -mwindows -municode -Wall -Wextra -o LiteTune.exe main.c resource.o \
+    -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite \
+    -lole32 -lgdiplus
 ```
 
 ## 系统要求
 
 - Windows 7 及以上
 - 最小窗口尺寸 480×360（客户区）
+
+## 关于 AI 辅助开发
+
+本项目在开发过程中使用 AI 编程助手（Trae）进行辅助，具体包括：
+
+- **代码编写**：界面布局、控件自绘、RSS 解析、WinHTTP 下载、Media Foundation 播放等模块由人与 AI 协作完成
+- **问题排查**：编译错误、暗色主题重绘、控件子类化等问题借助 AI 分析定位
+- **代码整理**：多语言字符串表抽取、冗余代码清理、注释与文档更新
+
+程序的整体设计、功能取舍（如 ESC 直接退出、单文件无依赖、默认中文）由作者决定；所有代码均经作者确认。源代码不包含任何遥测、统计或网络数据上报行为。
